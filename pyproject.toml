@@ -1,0 +1,23 @@
+[project]
+name = "finn"
+version = "0.1.0"
+description = "Local short-trip planning agent — DAG + ReAct hybrid architecture"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "pydantic-ai-slim[openai]>=1.0.0",
+    "langgraph>=0.6.0",
+    "langchain-core>=0.3.0",
+    "openai>=1.0.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+finn = "finn.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/finn"]
