@@ -8,8 +8,6 @@ thinking mode does not support tool_choice (required by native output_type).
 """
 
 import json
-import logging
-import os
 import re
 import time
 
@@ -18,9 +16,10 @@ from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 from langgraph.types import interrupt, Send
 
+from finn.config import config
+from finn.logger import logger
+from finn.cli import get_on_token, get_on_tool
 from finn.state import AgentState, BookingResult, Intent, Plan, SubTask, Verification
-
-logger = logging.getLogger("finn")
 
 # ═══════════════════════════════════════════════════════════════════════
 # Shared helpers
@@ -29,29 +28,51 @@ logger = logging.getLogger("finn")
 
 def _make_model() -> OpenAIChatModel:
     provider = OpenAIProvider(
-        base_url=os.getenv("LLM_BASE_URL", "https://api.deepseek.com"),
-        api_key=os.getenv("LLM_API_KEY"),
+        base_url=config.llm_base_url,
+        api_key=config.llm_api_key,
     )
     return OpenAIChatModel(
-        model_name=os.getenv("LLM_MODEL", "deepseek-chat"),
+        model_name=config.llm_model,
         provider=provider,
     )
 
 
-async def _run_agent(agent: Agent, prompt: str, node: str) -> str:
-    """Run an agent and return its response text, with logging."""
+async def _run_agent(
+    agent: Agent, prompt: str, node: str, *, stream: bool = False
+) -> str:
+    """Run an agent and return its response text, with logging.
+
+    Set ``stream=True`` to stream text deltas through the ``on_token``
+    callback (for user-visible text responses).  Structured-output nodes
+    should leave ``stream=False`` (default).
+    """
     model = agent.model.model_name if agent.model else "?"
+    on_token = get_on_token() if stream else None
     logger.info("→ %s | model=%s | prompt=%d chars", node, model, len(prompt))
     t0 = time.monotonic()
+
     try:
-        result = await agent.run(prompt)
+        if on_token is not None:
+            # ── streaming path ──
+            collected: list[str] = []
+            async with agent.run_stream(prompt) as streamed:
+                async for delta in streamed.stream_text(delta=True):
+                    on_token(delta)
+                    collected.append(delta)
+            text = "".join(collected)
+            if not text.strip():
+                text = streamed.response.text
+        else:
+            # ── fast path (no streaming) ──
+            result = await agent.run(prompt)
+            text = result.response.text
+
         elapsed = time.monotonic() - t0
-        text = result.response.text
         logger.info("← %s | %d chars in %.1fs", node, len(text), elapsed)
         return text
     except Exception:
         elapsed = time.monotonic() - t0
-        logger.exception("✗ %s | failed after %.1fs", node, elapsed)
+        logger.error("✗ %s | failed after %.1fs", node, elapsed)
         raise
 
 
@@ -150,7 +171,9 @@ If you don't know something, say so honestly. Keep answers under 200 words."""
 async def simple_answer(state: AgentState) -> dict:
     """Node 2a: Answer a simple non-trip question."""
     agent = Agent(_make_model(), system_prompt=SIMPLE_ANSWER_PROMPT)
-    text = await _run_agent(agent, state["messages"][-1].content, "simple_answer")
+    text = await _run_agent(
+        agent, state["messages"][-1].content, "simple_answer", stream=True
+    )
     return {
         "messages": [{"role": "assistant", "content": text}],
         "next_action": "done",
