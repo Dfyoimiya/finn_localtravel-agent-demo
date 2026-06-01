@@ -1,6 +1,6 @@
 """LangGraph DAG — workflow orchestration layer.
 
-Step 4 graph (with failure handling & compensation):
+Step 5 graph (with Send() fan-out for parallel booking execution):
 
     START
       │
@@ -19,36 +19,43 @@ Step 4 graph (with failure handling & compensation):
                      │       │     ┌──────┼──────┐         │
                      │       │  confirm │ modify  cancel   │
                      │       │     │     │        │        │
-                     │       │     ▼     ▼        │        │
-                     │       │  execute  │        │        │
-                     │       │  _bookings│        │        │
-                     │       │     │     │        │        │
-                     │       │     │     └──→ decompose    │
-                     │       │     │          _and_plan    │
-                     │       │     │              │        │
-                     │       │     ▼              │        │
-                     │       │ verify_execution    │        │
-                     │       │     │               │        │
-                     │       │  ┌──┴──┐            │        │
-                     │       │ done  partial/fail  │        │
-                     │       │  │      │           │        │
-                     │       │  │   handle_failures│        │
-                     │       │  │      │           │        │
-                     │       │  │   ┌──┴──┐        │        │
-                     │       │  │  retry notify    │        │
+                     │       │  [Send()] │        │        │
+                     │       │  ┌──┼──┐  │        │        │
+                     │       │  ▼  ▼  ▼  │        │        │
+                     │       │  B  B  B   │        │        │
+                     │       │  W  W  W   │        │        │
+                     │       │  │  │  │   │        │        │
+                     │       │  └──┼──┘   │        │        │
+                     │       │     ▼      │        │        │
+                     │       │ verify_exec│       │        │
+                     │       │     │      │        │        │
+                     │       │  ┌──┴──┐   │        │        │
+                     │       │ done partial│       │        │
+                     │       │  │  fail    │        │        │
                      │       │  │   │     │        │        │
-                     │       │  │   ▼     ▼        │        │
-                     │       │  │ execute notify   │        │
-                     │       │  │_bookings _user    │        │
-                     │       │  │   │               │        │
-                     │       │  │   └───────────────┤        │
-                     │       │  ▼                   │        │
-                     │       │ summarize_result     │        │
-                     │       │     │                │        │
-                     ├→ END (clarify)               │        │
-                     └→ reject ◄────────────────────┘        │
-                                                            │
-                    All terminal → END ◄────────────────────┘
+                     │       │  │ handle_failures  │        │
+                     │       │  │   │     │        │        │
+                     │       │  │ [Send()]│        │        │
+                     │       │  │  │ │ │  │        │        │
+                     │       │  │  ▼ ▼ ▼  │        │        │
+                     │       │  │  B B B  │        │        │
+                     │       │  │  W W W  │        │        │
+                     │       │  │  │ │ │  │        │        │
+                     │       │  │  └─┼─┘  │        │        │
+                     │       │  │    ▼    │        │        │
+                     │       │  │ verify_exec│     │        │
+                     │       │  │    │     │        │        │
+                     │       │  ▼    │     │        │        │
+                     │       │ sum-  │     │        │        │
+                     │       │ marize│     │        │        │
+                     │       │       │     │        │        │
+                     ├→ END (clarify)     │        │        │
+                     └→ reject ◄──────────┘        │        │
+                     BW = book_worker   notify_user │        │
+                     [Send()] = route returns       │        │
+                     list[Send] for parallel fan-out│        │
+                                                    │        │
+                    All terminal → END ◄────────────┘
 """
 
 from langgraph.graph import END, StateGraph
@@ -56,9 +63,9 @@ from langgraph.graph import END, StateGraph
 from finn.state import AgentState
 from finn.nodes import (
     adjust_plan,
+    book_worker,
     clarify_intent,
     decompose_and_plan,
-    execute_bookings,
     handle_failures,
     notify_user,
     present_to_user,
@@ -86,7 +93,7 @@ def create_graph():
     graph.add_node("reject", reject)                            # Node 2c
     graph.add_node("verify_plan", verify_plan)                  # Node 3
     graph.add_node("present_to_user", present_to_user)          # Node 4 ★ HITL
-    graph.add_node("execute_bookings", execute_bookings)        # Node 5
+    graph.add_node("book_worker", book_worker)                  # Node 5 (fan-out)
     graph.add_node("verify_execution", verify_execution)        # Node: execution check
     graph.add_node("handle_failures", handle_failures)          # Node 6b
     graph.add_node("summarize_result", summarize_result)        # Node 6a
@@ -114,14 +121,14 @@ def create_graph():
         {"present_to_user": "present_to_user", "adjust_plan": "adjust_plan", "reject": "reject"},
     )
 
-    # Present → Execute / Re-decompose (modify) / Cancel
+    # Present → fan-out to book_worker (confirm) / Re-decompose (modify) / Cancel
     graph.add_conditional_edges(
         "present_to_user", route_after_present,
-        {"execute_bookings": "execute_bookings", "decompose_and_plan": "decompose_and_plan", "cancel": END},
+        {"decompose_and_plan": "decompose_and_plan", "cancel": END, "summarize": "summarize_result"},
     )
 
-    # Execute → Verify execution
-    graph.add_edge("execute_bookings", "verify_execution")
+    # book_worker → Verify execution (after all fan-out tasks complete)
+    graph.add_edge("book_worker", "verify_execution")
 
     # Verify exec → Summarize / Handle failures
     graph.add_conditional_edges(
@@ -129,10 +136,10 @@ def create_graph():
         {"summarize": "summarize_result", "handle_failures": "handle_failures"},
     )
 
-    # Handle failures → Retry / Notify
+    # Handle failures → fan-out retry (list[Send]) / Notify
     graph.add_conditional_edges(
         "handle_failures", route_after_handle_failures,
-        {"execute_bookings": "execute_bookings", "notify": "notify_user"},
+        {"notify": "notify_user"},
     )
 
     # Terminal nodes → END

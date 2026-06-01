@@ -3,11 +3,21 @@
 State flows through LangGraph nodes. Each node reads and writes these fields.
 """
 
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field
 
 from langgraph.graph import MessagesState
+
+
+def _merge_bookings(
+    left: dict[str, "BookingResult"],
+    right: dict[str, "BookingResult"],
+) -> dict[str, "BookingResult"]:
+    """Merge two booking dicts — right-side keys take precedence."""
+    merged = dict(left)
+    merged.update(right)
+    return merged
 
 
 # ── Phase 1: Clarify ─────────────────────────────────────────────────
@@ -87,6 +97,10 @@ class AgentState(MessagesState):
     modify_feedback: str
 
     # Execution phase
-    bookings: dict[str, BookingResult]
+    bookings: Annotated[dict[str, BookingResult], _merge_bookings]
     execution_status: Literal["idle", "running", "partial", "done", "failed", "compensated"]
     retry_count: int
+
+    # Fan-out context (set via Send.arg for book_worker)
+    current_task_id: str
+    current_retry_count: int

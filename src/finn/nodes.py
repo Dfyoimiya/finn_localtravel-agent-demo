@@ -14,7 +14,7 @@ import re
 from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
-from langgraph.types import interrupt
+from langgraph.types import interrupt, Send
 
 from finn.state import AgentState, BookingResult, Intent, Plan, SubTask, Verification
 
@@ -411,7 +411,7 @@ async def present_to_user(state: AgentState) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Node 5: execute_bookings
+# Node 5: book_worker  (fan-out via Send)
 # ═══════════════════════════════════════════════════════════════════════
 
 import hashlib
@@ -426,16 +426,12 @@ def _simulate_booking(task: SubTask, retry_count: int = 0) -> BookingResult:
     In production this would be a real API call. For now, uses
     a hash of the task id to produce repeatable pass/fail outcomes.
     """
-    # Determine pass/fail deterministically from task id
     seed = int(hashlib.md5(task.id.encode()).hexdigest()[:8], 16)
     rng = random.Random(seed + retry_count * 1000)  # retry shifts the outcome
 
     roll = rng.random()
 
     # Compensation/cancel tasks always succeed
-    if task.id.startswith("cancel") or task.compensatory is None is False:
-        # Actually, check: is this task itself a compensatory cancel?
-        pass
     if "cancel" in task.id.lower():
         return BookingResult(
             task_id=task.id, status="success",
@@ -464,45 +460,31 @@ def _simulate_booking(task: SubTask, retry_count: int = 0) -> BookingResult:
         )
 
 
-async def execute_bookings(state: AgentState) -> dict:
-    """Node 5: Execute booking sub-tasks (simulated).
+async def book_worker(state: AgentState) -> dict:
+    """Node 5: Execute a single booking task (invoked via Send fan-out).
 
-    In step 5 this becomes a proper Send()-based fan-out for
-    parallel execution. Currently simulates each booking serially.
+    Receives `plan`, `current_task_id`, and `current_retry_count` set
+    by Send.arg. Looks up the task in the plan, simulates the booking,
+    and returns a partial booking result for merge-back.
     """
-    plan = state["plan"]
-    existing = state.get("bookings", {})
-    retry_count = state.get("retry_count", 0)
+    task_id = state.get("current_task_id", "")
+    plan = state.get("plan")
+    retry_count = state.get("current_retry_count", 0)
 
-    # Find book tasks that are NOT compensations and need execution
-    book_tasks = [
-        st for st in plan.sub_tasks
-        if st.type == "book" and not st.id.startswith("cancel")
-    ]
+    task = next((st for st in plan.sub_tasks if st.id == task_id), None)
+    if task is None:
+        return {
+            "bookings": {
+                task_id: BookingResult(
+                    task_id=task_id, status="failed",
+                    error=f"Task {task_id} not found in plan",
+                    error_type="fatal",
+                )
+            }
+        }
 
-    results: dict[str, BookingResult] = dict(existing)
-    for st in book_tasks:
-        prev = existing.get(st.id)
-        if prev and prev.status == "success":
-            continue  # already succeeded, skip
-        results[st.id] = _simulate_booking(st, retry_count)
-
-    succeeded = sum(1 for r in results.values() if r.status == "success")
-    failed = sum(1 for r in results.values() if r.status == "failed")
-    total = len(book_tasks)
-
-    if failed == 0:
-        es = "done"
-    elif succeeded == 0:
-        es = "failed"
-    else:
-        es = "partial"
-
-    return {
-        "bookings": results,
-        "execution_status": es,
-        "retry_count": retry_count,
-    }
+    result = _simulate_booking(task, retry_count)
+    return {"bookings": {task_id: result}}
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -531,8 +513,16 @@ async def verify_execution(state: AgentState) -> dict:
         r = bookings[tid]
         lines.append(f"  ❌ {tid}: {r.error} [{r.error_type}]")
 
+    if len(failed) == 0:
+        es = "done"
+    elif len(succeeded) == 0:
+        es = "failed"
+    else:
+        es = "partial"
+
     return {
         "messages": [{"role": "assistant", "content": "\n".join(lines)}],
+        "execution_status": es,
     }
 
 
@@ -690,11 +680,29 @@ def route_after_verify(state: AgentState) -> str:
     return "reject"
 
 
-def route_after_present(state: AgentState) -> str:
-    """Edge C: Route based on user decision after plan review."""
+def route_after_present(state: AgentState):
+    """Edge C: Route based on user decision after plan review.
+
+    Returns list[Send] for confirm (fan-out to book_worker),
+    or a string destination for modify/cancel.
+    """
     action = state.get("next_action", "cancel")
     if action == "confirm":
-        return "execute_bookings"
+        plan = state["plan"]
+        book_tasks = [
+            st for st in (plan.sub_tasks if plan else [])
+            if st.type == "book" and "cancel" not in st.id.lower()
+        ]
+        if not book_tasks:
+            return "summarize"  # nothing to execute; skip to summary
+        return [
+            Send("book_worker", {
+                "plan": plan,
+                "current_task_id": st.id,
+                "current_retry_count": 0,
+            })
+            for st in book_tasks
+        ]
     elif action == "modify":
         return "decompose_and_plan"
     else:
@@ -712,12 +720,29 @@ def route_after_exec(state: AgentState) -> str:
         return "handle_failures"
 
 
-def route_after_handle_failures(state: AgentState) -> str:
-    """Edge E: Route after failure handling."""
+def route_after_handle_failures(state: AgentState):
+    """Edge E: Route after failure handling.
+
+    Returns list[Send] for retry (fan-out only failed transient tasks),
+    or "notify" to escalate to user.
+    """
     action = state.get("next_action", "notify")
     retry_count = state.get("retry_count", 0)
 
     if action == "retry" and retry_count < MAX_RETRY_TOTAL:
-        return "execute_bookings"
+        plan = state["plan"]
+        bookings = state.get("bookings", {})
+        sends = [
+            Send("book_worker", {
+                "plan": plan,
+                "current_task_id": tid,
+                "current_retry_count": retry_count,
+            })
+            for tid, r in bookings.items()
+            if r.status == "failed" and r.error_type == "transient"
+        ]
+        if sends:
+            return sends
+        return "notify"
     else:
         return "notify"

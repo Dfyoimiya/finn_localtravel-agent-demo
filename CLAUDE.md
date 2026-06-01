@@ -30,7 +30,7 @@ Full architecture design: `docs/architecture.md`
 | `src/finn/main.py` | Entry point. Interactive CLI loop with checkpointing (`MemorySaver`). |
 | `src/finn/agent.py` | Legacy factory (unused by current flow; kept for reference). |
 
-### Current DAG (step 4 implemented)
+### Current DAG (step 5 implemented)
 
 ```
 START → clarify_intent ─┬→ decompose_and_plan → verify_plan
@@ -47,35 +47,28 @@ START → clarify_intent ─┬→ decompose_and_plan → verify_plan
                         │       │     ┌──────┼──────┐         │
                         │       │  confirm │ modify  cancel   │
                         │       │     │     │        │        │
-                        │       │     ▼     ▼        │        │
-                        │       │  execute  │        │        │
-                        │       │  _bookings│        │        │
-                        │       │     │     │        │        │
-                        │       │     │     └──→ decompose    │
-                        │       │     │          _and_plan    │
-                        │       │     │              │        │
-                        │       │     ▼              │        │
-                        │       │ verify_execution    │        │
-                        │       │     │               │        │
-                        │       │  ┌──┴──┐            │        │
-                        │       │ done  partial/fail  │        │
-                        │       │  │      │           │        │
-                        │       │  │   handle_failures│        │
-                        │       │  │      │           │        │
-                        │       │  │   ┌──┴──┐        │        │
-                        │       │  │  retry notify    │        │
-                        │       │  │   │     │        │        │
-                        │       │  │   ▼     ▼        │        │
-                        │       │  │ execute notify   │        │
-                        │       │  │_bookings _user    │        │
-                        │       │  │   │               │        │
-                        │       │  │   └───────────────┤        │
-                        │       │  ▼                   │        │
-                        │       │ summarize_result     │        │
-                        │       │     │                │        │
-                        ├→ END (clarify)               │        │
-                        └→ reject ◄────────────────────┘        │
-                                                                │
+                        │       │  [Send()] │        │        │
+                        │       │  ┌──┼──┐  │        │        │
+                        │       │  ▼  ▼  ▼  │        │        │
+                        │       │  book_worker│       │        │
+                        │       │  (fan-out)  │        │        │
+                        │       │     │       │        │        │
+                        │       │     ▼       │        │        │
+                        │       │ verify_exec │       │        │
+                        │       │     │       │        │        │
+                        │       │  ┌──┴──┐    │        │        │
+                        │       │ done  partial/fail   │        │
+                        │       │  │      │    │        │        │
+                        │       │  │ handle_failures   │        │
+                        │       │  │      │    │        │        │
+                        │       │  │   [Send()]│        │        │
+                        │       │  │   (retry) │        │        │
+                        │       │  │      │    │        │        │
+                        │       │  ▼      │    │        │        │
+                        │       │ summarize_result    │        │
+                        ├→ END (clarify)              │        │
+                        └→ reject ◄───────────────────┘        │
+                                                               │
                        All terminal → END ◄────────────────────┘
 ```
 
@@ -85,12 +78,44 @@ START → clarify_intent ─┬→ decompose_and_plan → verify_plan
 - `verify_plan` — evaluates plan against 5 dimensions; outputs `Verification` (score 0-1, issues[], status pass/fix/reject)
 - `adjust_plan` — fixes verification issues; re-enters verify (max 4 total iterations; user modify resets counter)
 - `present_to_user` — **HITL**: `interrupt()` pauses graph; user chooses confirm/modify/cancel
-- `execute_bookings` — simulated booking execution (deterministic hash-based: 75% success, 15% transient, 10% recoverable). Cancel tasks always succeed
-- `verify_execution` — classifies results into succeeded/failed buckets; reports to state
+- `book_worker` — single-task booking node invoked via `Send()` fan-out. Each instance executes one non-cancel book task (deterministic hash-based: 75% success, 15% transient, 10% recoverable)
+- `verify_execution` — classifies results into succeeded/failed buckets; computes `execution_status`; reports to state
 - `handle_failures` — classifies each failure: transient→retry (max 2 per task), recoverable→compensate (run compensatory cancel task), fatal→escalate to user
 - `summarize_result` — final report: confirmed bookings, compensated cancellations, failures
 - `notify_user` — escalation for non-retryable failures: tells user what failed and asks them to try again
 - `reject` — capability boundary message (non-trip queries)
+
+### Send() fan-out pattern (step 5)
+
+`route_after_present` and `route_after_handle_failures` return `list[Send]` instead of a string for fan-out:
+
+```python
+# Initial execution: fan out each book task in parallel
+def route_after_present(state):
+    if action == "confirm":
+        return [Send("book_worker", {
+            "plan": plan,
+            "current_task_id": st.id,
+            "current_retry_count": 0,
+        }) for st in plan.sub_tasks
+         if st.type == "book" and "cancel" not in st.id.lower()]
+
+# Retry: fan out only failed transient tasks
+def route_after_handle_failures(state):
+    if action == "retry":
+        return [Send("book_worker", {
+            "plan": plan,
+            "current_task_id": tid,
+            "current_retry_count": retry_count,
+        }) for tid, r in bookings.items()
+         if r.status == "failed" and r.error_type == "transient"]
+```
+
+- `Send.arg` dict passes per-task context (plan + task_id + retry_count) to each worker
+- All workers run **concurrently** in the same superstep (fan-out)
+- Results merge back via `Annotated[dict, _merge_bookings]` reducer on `bookings` key
+- After all workers complete, flow continues to `verify_execution` (fan-in)
+- `Send` objects bypass the conditional edge path_map — only non-Send destinations need mapping
 
 ### HITL interrupt flow
 
@@ -109,7 +134,7 @@ START → clarify_intent ─┬→ decompose_and_plan → verify_plan
 | `Plan` | sub_tasks[], total_cost_estimate, notes |
 | `Verification` | score (0-1), issues[], status (pass/fix/reject) |
 | `BookingResult` | task_id, status (pending/success/failed/cancelled/compensated), order_id, error, error_type (transient/recoverable/fatal), retries |
-| `AgentState` | extends MessagesState: intent, plan, verification, plan_iterations, next_action, modify_feedback, bookings (dict[str, BookingResult]), execution_status (idle/running/partial/done/failed/compensated), retry_count |
+| `AgentState` | extends MessagesState: intent, plan, verification, plan_iterations, next_action, modify_feedback, bookings (Annotated[dict[str, BookingResult], _merge_bookings] — reducer for parallel fan-in), execution_status (idle/running/partial/done/failed/compensated), retry_count, current_task_id (set by Send.arg), current_retry_count (set by Send.arg) |
 
 ### State flow
 
