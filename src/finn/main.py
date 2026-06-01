@@ -26,6 +26,7 @@ from finn.logger import logger
 _checkpoint_serde = JsonPlusSerializer(
     allowed_msgpack_modules=[
         ("finn.state", "Intent"),
+        ("finn.state", "PartyMember"),
         ("finn.state", "Plan"),
         ("finn.state", "Verification"),
         ("finn.state", "SubTask"),

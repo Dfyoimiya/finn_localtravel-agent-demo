@@ -23,17 +23,68 @@ def _merge_bookings(
 # ── Phase 1: Clarify ─────────────────────────────────────────────────
 
 
-class Intent(BaseModel):
-    """Structured trip planning intent extracted from user input."""
+class PartyMember(BaseModel):
+    """A person or category of people in the party."""
 
-    goal: str | None = None
-    date: str | None = None
-    location: str | None = None
-    budget: float | None = None
+    role: str = ""
+    # "self", "spouse", "child", "friend", "colleague"
+    age: int | None = None
+    constraints: list[str] = Field(default_factory=list)
+    # e.g. "减肥中", "不吃辣", "海鲜过敏", "需要午睡"
     preferences: list[str] = Field(default_factory=list)
-    missing_fields: list[str] = Field(default_factory=list)
+    # e.g. "喜欢户外", "想喝奶茶", "想看IMAX"
+
+
+class Intent(BaseModel):
+    """Clarify phase — structured trip intent extracted from conversation.
+
+    Design:
+    - Every field the LLM can populate is above the fold.
+    - ``missing_critical`` is set by *code* after extraction, not by the LLM.
+    - Downstream nodes read ``activity`` / ``date`` / ``start_location``
+      as canonical keys (no more ``goal`` / ``location`` ambiguity).
+    """
+
+    # ── Core (program-validated) ────────────────────────────────────
+    activity: str = ""
+    # "喝咖啡然后看电影", "亲子乐园+晚餐", "吃火锅"
+    date: str | None = None
+    # "周六", "2026-06-07", "今天"
+    start_location: str | None = None
+    # 出发地: "家", "国贸", "望京SOHO"
+
+    # ── Scenario ────────────────────────────────────────────────────
+    scenario: Literal["family", "friends", "couple", "solo", "unknown"] = "unknown"
+
+    # ── Time ────────────────────────────────────────────────────────
+    start_time: str | None = None
+    # "14:00", "下午2点", "午饭后"
+    duration_hours: float | None = None
+    # 预计时长
+
+    # ── Space ───────────────────────────────────────────────────────
+    area: str | None = None
+    # 活动区域/商圈
+    radius_km: float | None = None
+    # 可接受最远距离 (km), null=不限
+
+    # ── Party ───────────────────────────────────────────────────────
+    party_size: int | None = None
+    party_members: list[PartyMember] = Field(default_factory=list)
+
+    # ── Budget ──────────────────────────────────────────────────────
+    budget_total: float | None = None
+    budget_per_person: float | None = None
+
+    # ── Constraints ─────────────────────────────────────────────────
+    hard_constraints: list[str] = Field(default_factory=list)
+    # 必须满足: "需儿童座椅", "18:00前结束", "清真饮食", "包间"
+    preferences: list[str] = Field(default_factory=list)
+    # 尽量满足: "安静", "户外", "高评分", "川菜", "适合拍照"
+
+    # ── Validation (set by code, not LLM) ──────────────────────────
+    missing_critical: list[str] = Field(default_factory=list)
     follow_up_question: str | None = None
-    is_complete: bool = False
 
 
 # ── Phase 2: Plan ────────────────────────────────────────────────────
@@ -86,7 +137,7 @@ class BookingResult(BaseModel):
 class AgentState(MessagesState):
     """State carried through every LangGraph node.
 
-    Inherits `messages` with add_messages reducer from MessagesState.
+    Inherits ``messages`` with ``add_messages`` reducer from ``MessagesState``.
     """
 
     intent: Intent | None

@@ -110,65 +110,90 @@ CLARIFY_SYSTEM_PROMPT = """\
 You are an intent extraction module for Finn, a local short-trip planning agent.
 Analyze the conversation and extract/update structured trip planning intent.
 
-Output ONLY a valid JSON object with these fields:
-- goal: what the user wants to do, or null if not trip-related
-- date: when they want to go, or null
-- location: where they want to go, or null
-- budget: budget in CNY as a number, or null
-- preferences: list of preference strings (e.g. ["outdoor", "family-friendly"])
-- missing_fields: list of critical fields still needed (e.g. ["date", "location"])
-- follow_up_question: a natural Chinese question asking for the missing field(s), or null
-- is_complete: true if goal+date+location are all present, false otherwise
+Output ONLY a valid JSON object (no markdown, no extra text) with these fields:
 
-Critical fields: goal, date, location.
+{
+  "activity": "<what the user wants to do, e.g. 喝咖啡然后看电影.  Empty string if not trip-related>",
+  "date": "<e.g. 周六, 2026-06-07, 今天.  null if unknown>",
+  "start_location": "<where they depart from, e.g. 家, 国贸.  null if unknown>",
+  "scenario": "family | friends | couple | solo | unknown",
+  "start_time": "<e.g. 14:00, 下午2点.  null if unknown>",
+  "duration_hours": <float or null>,
+  "area": "<e.g. 朝阳区, 三里屯.  null if unknown>",
+  "radius_km": <float or null — how far they're willing to travel>,
+  "party_size": <int or null>,
+  "party_members": [
+    {
+      "role": "<self | spouse | child | friend | colleague>",
+      "age": <int or null>,
+      "constraints": ["<e.g. 减肥中, 不吃辣, 海鲜过敏>"],
+      "preferences": ["<e.g. 喜欢户外, 想喝奶茶>"]
+    }
+  ],
+  "budget_total": <float or null — total budget in CNY>,
+  "budget_per_person": <float or null — per-person budget in CNY>,
+  "hard_constraints": ["<e.g. 需儿童座椅, 18:00前结束, 清真饮食, 包间>"],
+  "preferences": ["<e.g. 安静, 户外, 高评分, 川菜, 适合拍照>"],
+  "follow_up_question": "<natural Chinese question asking for ONE missing critical field, or null>"
+}
 
-Key rules:
-- If a PREVIOUS INTENT is provided, MERGE the latest message into it —
-  carry forward all already-extracted fields (goal, date, location, budget,
-  preferences) unless the user explicitly changes them.
-- Only mark a field as collected when the user has ACTUALLY provided it.
-  Do NOT infer missing fields from context.
-- Ask only ONE missing field at a time. Be concise and natural in follow-up
-  questions. Use Chinese.
-- Output ONLY the JSON, no other text."""
+Rules:
+1. CRITICAL FIELDS: activity, date, start_location.  These MUST be collected before planning.
+2. If a PREVIOUS INTENT is provided in the prompt, MERGE the latest message into it —
+   carry forward all already-extracted fields unless the user explicitly changes them.
+3. SCENARIO detection: 老婆/孩子 → family; 朋友/几个人/姐妹/兄弟 → friends;
+   女朋友/男朋友/约会 → couple; 我一个人 → solo.
+4. PARTY: when scenario is family/friends, try to extract party_size and party_members.
+   Children under 12 → note in constraints (e.g. "需要儿童座椅", "需亲子设施").
+   Dietary/health constraints → put in member.constraints FOR THAT PERSON.
+5. CONSTRAINTS: user says "必须"/"不能"/"一定要" → hard_constraints.
+   User says "最好"/"喜欢"/"想" → preferences or member.preferences.
+   DO NOT put the same item in both lists.
+6. Only fill fields where the user has ACTUALLY provided information.
+   Leave unknown fields as null / empty list.  NEVER guess or invent.
+7. Ask only ONE missing critical field at a time in follow_up_question.
+   Use natural conversational Chinese.  If all critical fields present, set to null.
+8. Output ONLY the raw JSON object — no ``` fences, no extra text."""
+
+
+# Critical fields for programmatic validation
+_CRITICAL = ("activity", "date", "start_location")
 
 
 async def clarify_intent(state: AgentState) -> dict:
     """Node 1: Extract structured intent from the conversation.
 
-    Sends the full conversation history + previously extracted intent
-    so the LLM can carry forward already-collected fields across
-    multi-turn clarification.
+    Sends full conversation history + previous intent for multi-turn memory.
+    Validates critical fields in code (not LLM) and logs the extracted intent.
     """
-    # Build prompt from full conversation + existing intent
+    # ── Build prompt ──
     previous_intent = state.get("intent")
     existing_json = ""
-    if previous_intent and previous_intent.goal:
+    if previous_intent and previous_intent.activity:
         existing_json = (
-            f"\n\nPrevious intent (carry forward unless user changes):\n"
-            f"{previous_intent.model_dump_json(indent=2, exclude_none=True)}"
+            "\n\nPrevious intent (carry forward unless user changes):\n"
+            + previous_intent.model_dump_json(indent=2, exclude_none=True)
         )
 
-    # Format the last N messages as conversation context
     all_msgs = state["messages"]
-    recent = all_msgs[-6:]  # last 3 turns (user + assistant pairs)
+    recent = all_msgs[-6:]
     history = "\n".join(
         f"{getattr(m, 'role', '')}: {getattr(m, 'content', str(m))}"
         for m in recent
     )
-
     prompt = f"Conversation:\n{history}{existing_json}"
 
+    # ── LLM call ──
     try:
         agent = Agent(_make_model(), system_prompt=CLARIFY_SYSTEM_PROMPT)
         text = await _run_agent(agent, prompt, "clarify_intent")
         data = _extract_json(text)
-        clean = _strip_nulls(data, "goal")
+        clean = _strip_nulls(data, "activity")
         intent = Intent.model_validate(clean)
     except Exception:
-        # On any parsing failure, ask the user to rephrase
+        logger.warning("clarify_intent parse failure")
         return {
-            "intent": Intent(goal=""),
+            "intent": Intent(activity="", missing_critical=["activity"]),
             "next_action": "clarify",
             "messages": [{
                 "role": "assistant",
@@ -176,18 +201,52 @@ async def clarify_intent(state: AgentState) -> dict:
             }],
         }
 
-    if intent.is_complete:
-        next_action = "decompose_and_plan"
-    elif intent.goal is None:
+    # ── Programmatic validation ──
+    if not intent.activity or not intent.activity.strip():
         next_action = "reject"
+        intent.missing_critical = ["activity"]
     else:
-        next_action = "clarify"
+        missing = [f for f in _CRITICAL if getattr(intent, f) is None]
+        intent.missing_critical = missing
+        if missing:
+            next_action = "clarify"
+        else:
+            next_action = "decompose_and_plan"
+
+    # ── Log intent ──
+    _log_intent(intent, next_action)
 
     return {
         "intent": intent,
         "next_action": next_action,
-        "plan_iterations": 0,  # reset loop counter
+        "plan_iterations": 0,
     }
+
+
+def _log_intent(intent: Intent, next_action: str) -> None:
+    """Log extracted intent — summary at INFO, full JSON at DEBUG."""
+    members = len(intent.party_members)
+    info_parts = [
+        f"activity={intent.activity!r}",
+        f"date={intent.date!r}",
+        f"loc={intent.start_location!r}",
+    ]
+    if intent.scenario != "unknown":
+        info_parts.append(f"scenario={intent.scenario}")
+    if intent.party_size:
+        info_parts.append(f"party={intent.party_size}")
+    if intent.hard_constraints:
+        info_parts.append(f"hard={intent.hard_constraints}")
+    if intent.preferences:
+        info_parts.append(f"prefs={intent.preferences}")
+    info_parts.append(f"missing={intent.missing_critical}")
+    info_parts.append(f"→ {next_action}")
+
+    logger.info("Intent | %s", " | ".join(info_parts))
+    logger.debug(
+        "Intent JSON | %s",
+        intent.model_dump_json(indent=2, exclude_none=True),
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -287,14 +346,44 @@ async def decompose_and_plan(state: AgentState) -> dict:
     modify_feedback = state.get("modify_feedback", "")
     existing_plan = state.get("plan")
 
-    lines = [
-        f"User intent:",
-        f"  Goal: {intent.goal}",
-        f"  Date: {intent.date}",
-        f"  Location: {intent.location}",
-        f"  Budget: {intent.budget or 'not specified'} CNY",
-        f"  Preferences: {', '.join(intent.preferences) if intent.preferences else 'none'}",
-    ]
+    # Build a rich intent description for the planner
+    parts = [f"Activity: {intent.activity}"]
+    if intent.date:
+        parts.append(f"Date: {intent.date}")
+    if intent.start_time:
+        parts.append(f"Time: {intent.start_time}")
+    if intent.duration_hours:
+        parts.append(f"Duration: ~{intent.duration_hours}h")
+    if intent.start_location:
+        parts.append(f"Start: {intent.start_location}")
+    if intent.area:
+        parts.append(f"Area: {intent.area}")
+    if intent.radius_km:
+        parts.append(f"Max distance: {intent.radius_km}km")
+    if intent.scenario and intent.scenario != "unknown":
+        parts.append(f"Scenario: {intent.scenario}")
+    if intent.party_size:
+        parts.append(f"Party size: {intent.party_size}")
+    for m in intent.party_members:
+        member_str = f"  {m.role}"
+        if m.age:
+            member_str += f" (age {m.age})"
+        if m.constraints:
+            member_str += f" constraints: {m.constraints}"
+        if m.preferences:
+            member_str += f" prefs: {m.preferences}"
+        parts.append(member_str)
+    if intent.budget_total:
+        parts.append(f"Budget total: ¥{intent.budget_total}")
+    if intent.budget_per_person:
+        parts.append(f"Budget per person: ¥{intent.budget_per_person}")
+    if intent.hard_constraints:
+        parts.append(f"HARD constraints: {intent.hard_constraints}")
+    if intent.preferences:
+        parts.append(f"Preferences: {intent.preferences}")
+
+    lines = ["User intent:"]
+    lines.extend(f"  {p}" for p in parts)
 
     if modify_feedback and existing_plan:
         plan_json = existing_plan.model_dump_json(indent=2, exclude_none=True)
@@ -353,15 +442,41 @@ async def verify_plan(state: AgentState) -> dict:
     plan = state["plan"]
 
     plan_json = plan.model_dump_json(indent=2, exclude_none=True)
-    user_prompt = (
-        f"User intent:\n"
-        f"  Goal: {intent.goal}\n"
-        f"  Date: {intent.date}\n"
-        f"  Location: {intent.location}\n"
-        f"  Budget: {intent.budget or 'not specified'} CNY\n"
-        f"  Preferences: {', '.join(intent.preferences) if intent.preferences else 'none'}\n"
-        f"\nPlan to verify:\n{plan_json}"
-    )
+
+    # Build compact intent summary for verifier
+    i_lines = [f"Activity: {intent.activity}"]
+    if intent.date:
+        i_lines.append(f"Date: {intent.date}")
+    if intent.start_time:
+        i_lines.append(f"Time: {intent.start_time}")
+    if intent.duration_hours:
+        i_lines.append(f"Duration: ~{intent.duration_hours}h")
+    if intent.start_location:
+        i_lines.append(f"Start: {intent.start_location}")
+    if intent.area:
+        i_lines.append(f"Area: {intent.area}")
+    if intent.scenario and intent.scenario != "unknown":
+        i_lines.append(f"Scenario: {intent.scenario}")
+    if intent.party_size:
+        i_lines.append(f"Party: {intent.party_size}")
+    for m in intent.party_members:
+        mstr = f"  {m.role}"
+        if m.age:
+            mstr += f" (age {m.age})"
+        if m.constraints:
+            mstr += f" constraints={m.constraints}"
+        i_lines.append(mstr)
+    if intent.budget_total:
+        i_lines.append(f"Budget total: ¥{intent.budget_total}")
+    if intent.budget_per_person:
+        i_lines.append(f"Budget/person: ¥{intent.budget_per_person}")
+    if intent.hard_constraints:
+        i_lines.append(f"HARD: {intent.hard_constraints}")
+    if intent.preferences:
+        i_lines.append(f"Prefs: {intent.preferences}")
+
+    intent_text = "\n  ".join(i_lines)
+    user_prompt = f"User intent:\n  {intent_text}\n\nPlan to verify:\n{plan_json}"
 
     agent = Agent(_make_model(), system_prompt=VERIFY_PROMPT)
     text = await _run_agent(agent, user_prompt, "verify_plan")
