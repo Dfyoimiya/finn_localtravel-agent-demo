@@ -8,8 +8,10 @@ thinking mode does not support tool_choice (required by native output_type).
 """
 
 import json
+import logging
 import os
 import re
+import time
 
 from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIChatModel
@@ -17,6 +19,8 @@ from pydantic_ai.providers.openai import OpenAIProvider
 from langgraph.types import interrupt, Send
 
 from finn.state import AgentState, BookingResult, Intent, Plan, SubTask, Verification
+
+logger = logging.getLogger("finn")
 
 # ═══════════════════════════════════════════════════════════════════════
 # Shared helpers
@@ -32,6 +36,23 @@ def _make_model() -> OpenAIChatModel:
         model_name=os.getenv("LLM_MODEL", "deepseek-chat"),
         provider=provider,
     )
+
+
+async def _run_agent(agent: Agent, prompt: str, node: str) -> str:
+    """Run an agent and return its response text, with logging."""
+    model = agent.model.model_name if agent.model else "?"
+    logger.info("→ %s | model=%s | prompt=%d chars", node, model, len(prompt))
+    t0 = time.monotonic()
+    try:
+        result = await agent.run(prompt)
+        elapsed = time.monotonic() - t0
+        text = result.response.text
+        logger.info("← %s | %d chars in %.1fs", node, len(text), elapsed)
+        return text
+    except Exception:
+        elapsed = time.monotonic() - t0
+        logger.exception("✗ %s | failed after %.1fs", node, elapsed)
+        raise
 
 
 def _extract_json(text: str) -> dict:
@@ -88,8 +109,8 @@ async def clarify_intent(state: AgentState) -> dict:
     """Node 1: Extract structured intent from the conversation."""
     try:
         agent = Agent(_make_model(), system_prompt=CLARIFY_SYSTEM_PROMPT)
-        result = await agent.run(state["messages"][-1].content)
-        data = _extract_json(result.response.text)
+        text = await _run_agent(agent, state["messages"][-1].content, "clarify_intent")
+        data = _extract_json(text)
         clean = _strip_nulls(data, "goal")
         intent = Intent.model_validate(clean)
     except Exception:
@@ -129,9 +150,9 @@ If you don't know something, say so honestly. Keep answers under 200 words."""
 async def simple_answer(state: AgentState) -> dict:
     """Node 2a: Answer a simple non-trip question."""
     agent = Agent(_make_model(), system_prompt=SIMPLE_ANSWER_PROMPT)
-    result = await agent.run(state["messages"][-1].content)
+    text = await _run_agent(agent, state["messages"][-1].content, "simple_answer")
     return {
-        "messages": [{"role": "assistant", "content": result.response.text}],
+        "messages": [{"role": "assistant", "content": text}],
         "next_action": "done",
     }
 
@@ -232,8 +253,8 @@ async def decompose_and_plan(state: AgentState) -> dict:
     user_prompt = "\n".join(lines)
 
     agent = Agent(_make_model(), system_prompt=DECOMPOSE_PROMPT)
-    result = await agent.run(user_prompt)
-    data = _extract_json(result.response.text)
+    text = await _run_agent(agent, user_prompt, "decompose_and_plan")
+    data = _extract_json(text)
     data = _normalize_plan(data)
     clean = _strip_nulls(data)
     plan = Plan.model_validate(clean)
@@ -289,8 +310,8 @@ async def verify_plan(state: AgentState) -> dict:
     )
 
     agent = Agent(_make_model(), system_prompt=VERIFY_PROMPT)
-    result = await agent.run(user_prompt)
-    data = _extract_json(result.response.text)
+    text = await _run_agent(agent, user_prompt, "verify_plan")
+    data = _extract_json(text)
     verification = Verification.model_validate(data)
 
     iterations = state.get("plan_iterations", 0) + 1
@@ -349,8 +370,8 @@ async def adjust_plan(state: AgentState) -> dict:
     user_prompt = "\n".join(parts)
 
     agent = Agent(_make_model(), system_prompt=ADJUST_PROMPT)
-    result = await agent.run(user_prompt)
-    data = _extract_json(result.response.text)
+    text = await _run_agent(agent, user_prompt, "adjust_plan")
+    data = _extract_json(text)
     data = _normalize_plan(data)
     clean = _strip_nulls(data)
     revised = Plan.model_validate(clean)

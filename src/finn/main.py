@@ -2,9 +2,12 @@
 
 Usage:
     uv run finn          # interactive multi-turn session
+    uv run finn -v       # with verbose LLM call logging
 """
 
 import asyncio
+import logging
+import sys
 
 from dotenv import load_dotenv
 from langgraph.checkpoint.memory import MemorySaver
@@ -62,6 +65,19 @@ def _handle_plan_review(interrupt_value: dict):
 async def run_interactive():
     """Multi-turn CLI session with checkpointing and HITL interrupts."""
     load_dotenv()
+
+    # Configure logging: -v flag enables verbose LLM call logs
+    level = logging.DEBUG if "-v" in sys.argv else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)-5s %(message)s",
+        datefmt="%H:%M:%S",
+        stream=sys.stderr,
+    )
+    # Quiet noisy libraries
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("openai").setLevel(logging.WARNING)
+
     graph = create_graph()
     graph.checkpointer = _checkpoint_saver
     config = {"configurable": {"thread_id": f"cli-{id(graph)}"}}
