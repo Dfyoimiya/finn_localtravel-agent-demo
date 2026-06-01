@@ -108,7 +108,7 @@ def _normalize_plan(data: dict) -> dict:
 
 CLARIFY_SYSTEM_PROMPT = """\
 You are an intent extraction module for Finn, a local short-trip planning agent.
-Analyze the user's message and extract structured trip planning intent.
+Analyze the conversation and extract/update structured trip planning intent.
 
 Output ONLY a valid JSON object with these fields:
 - goal: what the user wants to do, or null if not trip-related
@@ -122,15 +122,46 @@ Output ONLY a valid JSON object with these fields:
 
 Critical fields: goal, date, location.
 
-Ask only ONE missing field at a time. Be concise and natural in follow-up questions.
-Output ONLY the JSON, no other text."""
+Key rules:
+- If a PREVIOUS INTENT is provided, MERGE the latest message into it —
+  carry forward all already-extracted fields (goal, date, location, budget,
+  preferences) unless the user explicitly changes them.
+- Only mark a field as collected when the user has ACTUALLY provided it.
+  Do NOT infer missing fields from context.
+- Ask only ONE missing field at a time. Be concise and natural in follow-up
+  questions. Use Chinese.
+- Output ONLY the JSON, no other text."""
 
 
 async def clarify_intent(state: AgentState) -> dict:
-    """Node 1: Extract structured intent from the conversation."""
+    """Node 1: Extract structured intent from the conversation.
+
+    Sends the full conversation history + previously extracted intent
+    so the LLM can carry forward already-collected fields across
+    multi-turn clarification.
+    """
+    # Build prompt from full conversation + existing intent
+    previous_intent = state.get("intent")
+    existing_json = ""
+    if previous_intent and previous_intent.goal:
+        existing_json = (
+            f"\n\nPrevious intent (carry forward unless user changes):\n"
+            f"{previous_intent.model_dump_json(indent=2, exclude_none=True)}"
+        )
+
+    # Format the last N messages as conversation context
+    all_msgs = state["messages"]
+    recent = all_msgs[-6:]  # last 3 turns (user + assistant pairs)
+    history = "\n".join(
+        f"{getattr(m, 'role', '')}: {getattr(m, 'content', str(m))}"
+        for m in recent
+    )
+
+    prompt = f"Conversation:\n{history}{existing_json}"
+
     try:
         agent = Agent(_make_model(), system_prompt=CLARIFY_SYSTEM_PROMPT)
-        text = await _run_agent(agent, state["messages"][-1].content, "clarify_intent")
+        text = await _run_agent(agent, prompt, "clarify_intent")
         data = _extract_json(text)
         clean = _strip_nulls(data, "goal")
         intent = Intent.model_validate(clean)
