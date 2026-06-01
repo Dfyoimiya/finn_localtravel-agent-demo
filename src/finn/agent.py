@@ -3,7 +3,7 @@
 import os
 
 from pydantic_ai import Agent
-from pydantic_ai.models.openai import OpenAIModel
+from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
 
@@ -13,7 +13,7 @@ def create_agent() -> Agent:
         base_url=os.getenv("LLM_BASE_URL", "https://api.deepseek.com"),
         api_key=os.getenv("LLM_API_KEY"),
     )
-    model = OpenAIModel(
+    model = OpenAIChatModel(
         model_name=os.getenv("LLM_MODEL", "deepseek-chat"),
         provider=provider,
     )
