@@ -33,6 +33,12 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 
+from finn.location import get_current_context, format_context
+from finn.logger import logger
+from finn.memory import MemoryManager, ProfileBuilder
+from finn.memory.extractor import extract_learnings_from_trip
+from finn.memory.models import TripMemory
+
 # ═══════════════════════════════════════════════════════════════════════
 # Context variables — set by CLI before graph invocation, read by nodes
 # ═══════════════════════════════════════════════════════════════════════
@@ -65,6 +71,23 @@ _STYLE = Style.from_dict({
     "prompt": "bold #00d7af",
     "separator": "#666666",
 })
+
+
+def _summarise_intent(intent) -> str:
+    """Create a short Chinese summary of an Intent for trip memory."""
+    parts = []
+    if intent.scenario and intent.scenario != "unknown":
+        labels = {"family": "家人", "friends": "朋友", "couple": "情侣", "solo": "独自"}
+        parts.append(f"与{labels.get(intent.scenario, intent.scenario)}")
+    if intent.party_size:
+        parts.append(f"{intent.party_size}人")
+    if intent.activity:
+        parts.append(intent.activity)
+    if intent.area:
+        parts.append(f"在{intent.area}")
+    if intent.budget_per_person:
+        parts.append(f"人均{int(intent.budget_per_person)}元")
+    return "，".join(parts)
 
 
 class CLI:
@@ -184,6 +207,16 @@ class CLI:
         )
         self._console.print()
 
+        # ── Cold-start profile check ──
+        memory = MemoryManager()
+        if not memory.profile_exists():
+            builder = ProfileBuilder()
+            profile = await builder.run(self)
+            memory.save_profile(profile)
+        else:
+            # Load profile (triggers decay check) so it's cached
+            memory.load_profile()
+
         is_tty = sys.stdin.isatty()
 
         while True:
@@ -208,11 +241,30 @@ class CLI:
                 config["configurable"]["thread_id"] = f"cli-{id(graph)}"
                 self._console.print("[对话已重置]\n")
                 continue
+            if user_input.lower() == "/profile":
+                profile = memory.load_profile()
+                if not profile.setup_complete:
+                    self._console.print("[尚未设置用户画像。]\n")
+                else:
+                    ctx_text = memory.build_profile_context()
+                    self._console.print(
+                        Panel(ctx_text, title="用户画像", border_style="bold #00d7af")
+                    )
+                    self._console.print()
+                continue
+
+            # ── Enrich with system context (time + IP location + profile) ──
+            ctx = get_current_context()
+            profile_ctx = memory.build_profile_context()
+            enriched_input = (
+                f"[系统上下文]\n{format_context(ctx)}\n{profile_ctx}\n[/系统上下文]\n\n{user_input}"
+            )
+            logger.debug("Context: %s", format_context(ctx))
 
             # ── Push callbacks & invoke graph ──
             self._push_callbacks()
             state = await graph.ainvoke(
-                {"messages": [{"role": "user", "content": user_input}]},
+                {"messages": [{"role": "user", "content": enriched_input}]},
                 config,
             )
 
@@ -227,6 +279,9 @@ class CLI:
 
             # ── Display response ──
             self._display_response(state)
+
+            # ── Post-trip learning ──
+            self._learn_from_trip(state)
 
     # ── interrupt handling ──────────────────────────────────────────
 
@@ -276,3 +331,58 @@ class CLI:
                 self._console.print()
         else:
             self._console.print("Finn: ...\n")
+
+    # ── post-trip learning ──────────────────────────────────────────
+
+    def _learn_from_trip(self, state: dict) -> None:
+        """Extract preference signals from a completed trip and update profile."""
+        import uuid
+        from datetime import datetime, timezone, timedelta
+
+        CST = timezone(timedelta(hours=8))
+
+        intent = state.get("intent")
+        execution_status = state.get("execution_status", "")
+
+        # Only learn from trips that actually ran (not clarify rounds or cancels)
+        if not intent or not intent.activity:
+            return
+        if intent.follow_up_question:
+            return  # clarify round — no trip happened
+        if execution_status not in ("done", "partial"):
+            return
+
+        plan = state.get("plan")
+        memory = MemoryManager()
+
+        # Extract preference signals
+        learnings = extract_learnings_from_trip(intent, plan)
+        if learnings:
+            memory.update_preferences(learnings)
+            logger.debug("Learned %d preference items from trip", len(learnings))
+
+        # Build trip memory
+        now = datetime.now(CST)
+        trip_id = str(uuid.uuid4())[:8]
+        trip = TripMemory(
+            id=trip_id,
+            created_at=now.isoformat(),
+            intent_summary=_summarise_intent(intent),
+            scenario=intent.scenario or "unknown",
+            activity=intent.activity,
+            date=intent.date,
+            area=intent.area,
+            party_size=intent.party_size,
+            budget_total=intent.budget_total,
+            plan_notes=plan.notes if plan else "",
+            outcome="completed",
+            extracted_learnings=learnings,
+        )
+        memory.save_trip(trip)
+
+        # Update saved party members if new ones were described
+        if intent.party_members:
+            profile = memory.load_profile()
+            if not profile.saved_party_members and intent.party_members:
+                profile.saved_party_members = intent.party_members
+                memory.save_profile(profile)

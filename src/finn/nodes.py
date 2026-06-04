@@ -1,79 +1,33 @@
-"""LangGraph node implementations.
+"""LangGraph node implementations using LangChain.
 
 Each node is a pure async function: (state, config) -> partial state update.
-Nodes that require LLM reasoning use PydanticAI ReAct agents internally.
+LLM nodes use LangChain's ChatOpenAI with manual ReAct loops for tool calling.
 
-Text-based JSON extraction is used for structured output because DeepSeek V4
-thinking mode does not support tool_choice (required by native output_type).
+Text-based JSON extraction for structured output (DeepSeek V4 does not
+support tool_choice in thinking mode).
 """
 
+from __future__ import annotations
+
+import hashlib
 import json
+import random
 import re
 import time
 
-from pydantic_ai import Agent
-from pydantic_ai.models.openai import OpenAIChatModel
-from pydantic_ai.providers.openai import OpenAIProvider
-from langgraph.types import interrupt, Send
+from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.graph import END
+from langgraph.types import Command, interrupt, Send
 
 from finn.config import config
+from finn.llm import llm_invoke, make_model, react_loop
 from finn.logger import logger
-from finn.cli import get_on_token, get_on_tool
+from finn.mcp import mcp_session
 from finn.state import AgentState, BookingResult, Intent, Plan, SubTask, Verification
 
 # ═══════════════════════════════════════════════════════════════════════
 # Shared helpers
 # ═══════════════════════════════════════════════════════════════════════
-
-
-def _make_model() -> OpenAIChatModel:
-    provider = OpenAIProvider(
-        base_url=config.llm_base_url,
-        api_key=config.llm_api_key,
-    )
-    return OpenAIChatModel(
-        model_name=config.llm_model,
-        provider=provider,
-    )
-
-
-async def _run_agent(
-    agent: Agent, prompt: str, node: str, *, stream: bool = False
-) -> str:
-    """Run an agent and return its response text, with logging.
-
-    Set ``stream=True`` to stream text deltas through the ``on_token``
-    callback (for user-visible text responses).  Structured-output nodes
-    should leave ``stream=False`` (default).
-    """
-    model = agent.model.model_name if agent.model else "?"
-    on_token = get_on_token() if stream else None
-    logger.info("→ %s | model=%s | prompt=%d chars", node, model, len(prompt))
-    t0 = time.monotonic()
-
-    try:
-        if on_token is not None:
-            # ── streaming path ──
-            collected: list[str] = []
-            async with agent.run_stream(prompt) as streamed:
-                async for delta in streamed.stream_text(delta=True):
-                    on_token(delta)
-                    collected.append(delta)
-            text = "".join(collected)
-            if not text.strip():
-                text = streamed.response.text
-        else:
-            # ── fast path (no streaming) ──
-            result = await agent.run(prompt)
-            text = result.response.text
-
-        elapsed = time.monotonic() - t0
-        logger.info("← %s | %d chars in %.1fs", node, len(text), elapsed)
-        return text
-    except Exception:
-        elapsed = time.monotonic() - t0
-        logger.error("✗ %s | failed after %.1fs", node, elapsed)
-        raise
 
 
 def _extract_json(text: str) -> dict:
@@ -94,7 +48,7 @@ def _normalize_plan(data: dict) -> dict:
     valid_types = {"search", "compare", "book"}
     for st in data.get("sub_tasks", []):
         if st.get("type") not in valid_types:
-            st["type"] = "search"  # default to search for unknown types
+            st["type"] = "search"
         if "dependencies" not in st:
             st["dependencies"] = []
         if "params" not in st:
@@ -107,66 +61,81 @@ def _normalize_plan(data: dict) -> dict:
 # ═══════════════════════════════════════════════════════════════════════
 
 CLARIFY_SYSTEM_PROMPT = """\
-You are an intent extraction module for Finn, a local short-trip planning agent.
-Analyze the conversation and extract/update structured trip planning intent.
+你是 Finn 的意图提取模块——一个本地短途出行规划 Agent。
 
-Output ONLY a valid JSON object (no markdown, no extra text) with these fields:
+你的任务：分析对话，输出一个 JSON 对象，同时包含提取的意图数据和路由决策。
+
+注意：对话中可能包含 [系统上下文] 标记，其中有当前时间、基于 IP 的用户位置，
+以及 [用户画像]（偏好口味、常去区域、常用同行人、预算范围等）。
+如果用户说"附近"、"今天"等模糊表述，使用系统上下文中的信息来填充具体值。
+如果用户画像中有匹配的偏好或同行人信息，优先使用并填充到意图中。
+
+只输出合法的 JSON 对象（不要 markdown，不要 ``` 代码块，不要额外文字）：
 
 {
-  "activity": "<what the user wants to do, e.g. 喝咖啡然后看电影.  Empty string if not trip-related>",
-  "date": "<e.g. 周六, 2026-06-07, 今天.  null if unknown>",
-  "start_location": "<where they depart from, e.g. 家, 国贸.  null if unknown>",
+  "route": "plan" | "clarify" | "reject",
+  "activity": "<用户想做什么，例如：喝咖啡然后看电影。不是出行需求则为空字符串>",
+  "date": "<例如：周六、2026-06-07、今天。未知则为 null>",
+  "start_location": "<出发地，例如：家、国贸。未知则为 null>",
   "scenario": "family | friends | couple | solo | unknown",
-  "start_time": "<e.g. 14:00, 下午2点.  null if unknown>",
-  "duration_hours": <float or null>,
-  "area": "<e.g. 朝阳区, 三里屯.  null if unknown>",
-  "radius_km": <float or null — how far they're willing to travel>,
-  "party_size": <int or null>,
+  "start_time": "<例如：14:00、下午2点。未知则为 null>",
+  "duration_hours": <float 或 null>,
+  "area": "<例如：朝阳区、三里屯。未知则为 null>",
+  "radius_km": <float 或 null>,
+  "party_size": <int 或 null>,
   "party_members": [
     {
       "role": "<self | spouse | child | friend | colleague>",
-      "age": <int or null>,
-      "constraints": ["<e.g. 减肥中, 不吃辣, 海鲜过敏>"],
-      "preferences": ["<e.g. 喜欢户外, 想喝奶茶>"]
+      "age": <int 或 null>,
+      "constraints": ["<例如：减肥中、不吃辣、海鲜过敏>"],
+      "preferences": ["<例如：喜欢户外、想喝奶茶>"]
     }
   ],
-  "budget_total": <float or null — total budget in CNY>,
-  "budget_per_person": <float or null — per-person budget in CNY>,
-  "hard_constraints": ["<e.g. 需儿童座椅, 18:00前结束, 清真饮食, 包间>"],
-  "preferences": ["<e.g. 安静, 户外, 高评分, 川菜, 适合拍照>"],
-  "follow_up_question": "<natural Chinese question asking for ONE missing critical field, or null>"
+  "budget_total": <float 或 null>,
+  "budget_per_person": <float 或 null>,
+  "hard_constraints": ["<例如：需儿童座椅、18:00前结束、清真饮食、包间>"],
+  "preferences": ["<例如：安静、户外、高评分、川菜、适合拍照>"],
+  "follow_up_question": "<自然的中文追问，或 null>"
 }
 
-Rules:
-1. CRITICAL FIELDS: activity, date, start_location.  These MUST be collected before planning.
-2. If a PREVIOUS INTENT is provided in the prompt, MERGE the latest message into it —
-   carry forward all already-extracted fields unless the user explicitly changes them.
-3. SCENARIO detection: 老婆/孩子 → family; 朋友/几个人/姐妹/兄弟 → friends;
-   女朋友/男朋友/约会 → couple; 我一个人 → solo.
-4. PARTY: when scenario is family/friends, try to extract party_size and party_members.
-   Children under 12 → note in constraints (e.g. "需要儿童座椅", "需亲子设施").
-   Dietary/health constraints → put in member.constraints FOR THAT PERSON.
-5. CONSTRAINTS: user says "必须"/"不能"/"一定要" → hard_constraints.
-   User says "最好"/"喜欢"/"想" → preferences or member.preferences.
-   DO NOT put the same item in both lists.
-6. Only fill fields where the user has ACTUALLY provided information.
-   Leave unknown fields as null / empty list.  NEVER guess or invent.
-7. Ask only ONE missing critical field at a time in follow_up_question.
-   Use natural conversational Chinese.  If all critical fields present, set to null.
-8. Output ONLY the raw JSON object — no ``` fences, no extra text."""
+══════════════════════════════════════
+路由规则 — 必须将 "route" 设为以下之一：
+══════════════════════════════════════
 
+"plan"
+  activity、date、start_location 均非 null。
+  可以进入任务分解与规划阶段。
+  此时 follow_up_question 必须为 null。
 
-# Critical fields for programmatic validation
-_CRITICAL = ("activity", "date", "start_location")
+"clarify"
+  activity 非 null（用户有出行意图），但 date 或 start_location
+  仍缺失。将 follow_up_question 设为一句简短的自然中文追问，
+  每次只问一个缺失字段。
+
+"reject"
+  activity 为空——这不是出行规划请求。
+  用户在闲聊、问事实性问题，或超出能力范围。
+
+══════════════════════════════════════
+提取规则
+══════════════════════════════════════
+1. 多轮合并：如果 prompt 中提供了 PREVIOUS INTENT，将最新消息合并进去——
+   除非用户明确修改，否则保留已提取的字段。
+2. 场景判断：老婆/孩子 → family；朋友/几个人/姐妹/兄弟 → friends；
+   女朋友/男朋友/约会 → couple；我一个人 → solo。
+3. 同行人：scenario 为 family/friends 时，提取 party_size 和 party_members。
+   12 岁以下儿童 → 在对应成员的 constraints 中加入"需儿童座椅"等。
+   饮食/健康备注 → 放入对应成员的 constraints。
+4. 约束分类："必须"/"不能"/"一定要" → hard_constraints。
+   "最好"/"喜欢"/"想" → preferences 或 member.preferences。
+   同一项不要同时出现在两个列表中。
+5. 诚实原则：只填用户实际提供的信息。null / 空列表好过瞎猜。
+6. 追问限制：每次只问一个缺失字段。自然中文。如果 route 是 "plan" 或 "reject"，
+   follow_up_question 必须为 null。"""
 
 
 async def clarify_intent(state: AgentState) -> dict:
-    """Node 1: Extract structured intent from the conversation.
-
-    Sends full conversation history + previous intent for multi-turn memory.
-    Validates critical fields in code (not LLM) and logs the extracted intent.
-    """
-    # ── Build prompt ──
+    """Node 1: Extract intent + route via Command."""
     previous_intent = state.get("intent")
     existing_json = ""
     if previous_intent and previous_intent.activity:
@@ -181,56 +150,90 @@ async def clarify_intent(state: AgentState) -> dict:
         f"{getattr(m, 'role', '')}: {getattr(m, 'content', str(m))}"
         for m in recent
     )
-    prompt = f"Conversation:\n{history}{existing_json}"
+    user_prompt = f"Conversation:\n{history}{existing_json}"
 
-    # ── LLM call ──
+    parse_error = False
     try:
-        agent = Agent(_make_model(), system_prompt=CLARIFY_SYSTEM_PROMPT)
-        text = await _run_agent(agent, prompt, "clarify_intent")
+        llm = make_model(temperature=0.3)
+        messages = [
+            SystemMessage(content=CLARIFY_SYSTEM_PROMPT),
+            HumanMessage(content=user_prompt),
+        ]
+        text = await llm_invoke(llm, messages, "clarify_intent", stream=True)
         data = _extract_json(text)
+        route = data.pop("route", "reject")
         clean = _strip_nulls(data, "activity")
         intent = Intent.model_validate(clean)
     except Exception:
-        logger.warning("clarify_intent parse failure")
-        return {
-            "intent": Intent(activity="", missing_critical=["activity"]),
-            "next_action": "clarify",
-            "messages": [{
-                "role": "assistant",
-                "content": "抱歉我没太理解，能换个方式说说你的需求吗？",
-            }],
-        }
+        logger.warning("clarify_intent parse failure — falling back to clarify")
+        parse_error = True
+        route = "clarify"
+        intent = Intent(activity="")
 
-    # ── Programmatic validation ──
+    # Fill missing_critical
     if not intent.activity or not intent.activity.strip():
-        next_action = "reject"
         intent.missing_critical = ["activity"]
     else:
-        missing = [f for f in _CRITICAL if getattr(intent, f) is None]
-        intent.missing_critical = missing
-        if missing:
-            next_action = "clarify"
-        else:
-            next_action = "decompose_and_plan"
+        intent.missing_critical = [
+            f for f in ("activity", "date", "start_location")
+            if getattr(intent, f) is None
+        ]
 
-    # ── Log intent ──
-    _log_intent(intent, next_action)
+    # Clarify iteration tracking
+    clarify_iterations = state.get("clarify_iterations", 0)
+    if route == "clarify":
+        clarify_iterations += 1
 
-    return {
-        "intent": intent,
-        "next_action": next_action,
-        "plan_iterations": 0,
-    }
+    _log_intent(intent, route, clarify_iterations)
+
+    # Fallback for parse errors
+    if parse_error:
+        return Command(
+            goto=END,
+            update={
+                "intent": intent,
+                "plan_iterations": 0,
+                "clarify_iterations": clarify_iterations + 1,
+                "messages": [{
+                    "role": "assistant",
+                    "content": "抱歉我没太理解，能换个方式说说你的需求吗？",
+                }],
+            },
+        )
+
+    # Enforce clarify limit
+    if route == "clarify" and clarify_iterations >= MAX_CLARIFY_ITERATIONS:
+        logger.info("Clarify limit reached (%d/%d) — forcing route",
+                    clarify_iterations, MAX_CLARIFY_ITERATIONS)
+        route = "plan" if intent.activity else "reject"
+
+    # Route via Command
+    if route == "plan":
+        return Command(
+            goto="decompose_and_plan",
+            update={"intent": intent, "plan_iterations": 0, "clarify_iterations": 0},
+        )
+    elif route == "clarify":
+        return Command(
+            goto=END,
+            update={"intent": intent, "plan_iterations": 0,
+                    "clarify_iterations": clarify_iterations},
+        )
+    else:
+        return Command(
+            goto="reject",
+            update={"intent": intent, "plan_iterations": 0, "clarify_iterations": 0},
+        )
 
 
-def _log_intent(intent: Intent, next_action: str) -> None:
-    """Log extracted intent — summary at INFO, full JSON at DEBUG."""
-    members = len(intent.party_members)
+def _log_intent(intent: Intent, route: str, clarify_n: int = 0) -> None:
     info_parts = [
         f"activity={intent.activity!r}",
         f"date={intent.date!r}",
         f"loc={intent.start_location!r}",
     ]
+    if clarify_n:
+        info_parts.append(f"clarify={clarify_n}/{MAX_CLARIFY_ITERATIONS}")
     if intent.scenario != "unknown":
         info_parts.append(f"scenario={intent.scenario}")
     if intent.party_size:
@@ -239,14 +242,12 @@ def _log_intent(intent: Intent, next_action: str) -> None:
         info_parts.append(f"hard={intent.hard_constraints}")
     if intent.preferences:
         info_parts.append(f"prefs={intent.preferences}")
-    info_parts.append(f"missing={intent.missing_critical}")
-    info_parts.append(f"→ {next_action}")
-
+    if intent.missing_critical:
+        info_parts.append(f"missing={intent.missing_critical}")
+    info_parts.append(f"→ {route}")
     logger.info("Intent | %s", " | ".join(info_parts))
-    logger.debug(
-        "Intent JSON | %s",
-        intent.model_dump_json(indent=2, exclude_none=True),
-    )
+    logger.debug("Intent JSON | %s",
+                 intent.model_dump_json(indent=2, exclude_none=True))
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -260,10 +261,12 @@ If you don't know something, say so honestly. Keep answers under 200 words."""
 
 async def simple_answer(state: AgentState) -> dict:
     """Node 2a: Answer a simple non-trip question."""
-    agent = Agent(_make_model(), system_prompt=SIMPLE_ANSWER_PROMPT)
-    text = await _run_agent(
-        agent, state["messages"][-1].content, "simple_answer", stream=True
-    )
+    llm = make_model(temperature=0.7)
+    messages = [
+        SystemMessage(content=SIMPLE_ANSWER_PROMPT),
+        HumanMessage(content=state["messages"][-1].content),
+    ]
+    text = await llm_invoke(llm, messages, "simple_answer", stream=True)
     return {
         "messages": [{"role": "assistant", "content": text}],
         "next_action": "done",
@@ -297,56 +300,79 @@ async def reject(state: AgentState) -> dict:
 # ═══════════════════════════════════════════════════════════════════════
 
 DECOMPOSE_PROMPT = """\
-You are a task planning module for Finn, a local short-trip planning agent.
-Given a structured user intent (and optionally a previous plan + revision request),
-decompose it into a concrete, executable plan.
+你是 Finn 的任务分解与规划模块。
 
-If this is a REVISION of an existing plan:
-- Start from the existing plan as a base
-- Apply the user's modification request
-- Keep everything the user didn't ask to change
-- Add, remove, or modify sub-tasks as requested
+你会收到用户出行意图。你需要基于真实数据构造一份可执行的出行计划。
 
-Output ONLY a valid JSON object:
+如果是修改已有计划：
+- 以已有计划为基础，按用户修改请求调整
+- 保留用户未要求修改的所有内容
+
+══════════════════════════════════════
+首要任务：使用工具搜索真实数据
+══════════════════════════════════════
+
+你拥有以下工具，必须主动调用它们来获取真实世界信息：
+
+maps_geo — 将地名转为经纬度坐标
+maps_around_search — 在指定坐标周边搜索 POI（名称、地址、评分）
+maps_text_search — 关键词搜索特定类型商家
+maps_search_detail — 查询 POI 详情（营业时间、电话、人均消费）
+maps_regeocode — 将坐标转为地址
+maps_distance — 计算两点直线距离
+maps_direction_walking — 步行路线和耗时
+maps_direction_driving — 驾车路线和耗时
+maps_direction_bicycling — 骑行路线和耗时
+maps_direction_transit_integrated — 公交/地铁路线和耗时
+maps_weather — 查询天气
+
+调用工具的基本流程：
+1. 用 maps_weather 查天气
+2. 用 maps_geo 获取出发地坐标
+3. 用 maps_around_search 搜索周边目标场所
+4. 对候选场所用 maps_search_detail 查详情
+5. 用 maps_direction_* 计算场所间路线和耗时
+
+══════════════════════════════════════
+搜索完成后，输出出行计划 JSON
+══════════════════════════════════════
+
 {
   "sub_tasks": [
     {
-      "id": "<unique_id>",
-      "type": "search" | "compare" | "book",
-      "target": "<what this accomplishes, e.g. lunch, movie, transport>",
-      "dependencies": ["<task_id>" ...],
-      "params": {<relevant parameters>},
-      "compensatory": "<cancel_task_id>" | null
+      "id": "<唯一ID>",
+      "type": "search | compare | book",
+      "target": "<任务目标，例如 午餐、电影、交通>",
+      "dependencies": ["<依赖的任务ID>" ...],
+      "params": {<相关参数，包含真实搜索到的商家名称和地址>},
+      "compensatory": "<对应的取消任务ID>" | null
     }
   ],
-  "total_cost_estimate": <number in CNY or null>,
-  "notes": "<natural language summary of the plan in Chinese>"
+  "total_cost_estimate": <预估总花费 CNY，或 null>,
+  "notes": "<中文摘要，介绍基于真实搜索结果的计划，包含具体商家名和路线>"
 }
 
-Rules:
-1. Max 8 sub-tasks.
-2. "search" tasks have no dependencies — they gather information.
-3. "book" tasks depend on at least one "search" task.
-4. Every "book" task must have a compensatory: the id of a matching cancel/refund task.
-5. Include transit between locations as tasks when needed.
-6. Be specific: name real venues, real times, real prices for the given location.
-7. If the user specified a budget, stay within it.
-8. Order tasks to form a coherent timeline.
-
-Output ONLY the JSON, no other text."""
+规则：
+1. 最多 8 个子任务
+2. "search" 任务无依赖，用于收集信息
+3. "book" 任务至少依赖一个 "search" 任务
+4. 每个 "book" 任务必须有 compensatory 取消任务
+5. 不同地点间需加交通子任务（基于实际路线耗时）
+6. 商家名称、地址必须来自工具返回的真实数据，禁止编造
+7. 用户指定了预算则严格控制在预算内
+8. 子任务按时间线有序排列"""
 
 
 async def decompose_and_plan(state: AgentState) -> dict:
     """Node 2b: Decompose intent into executable sub-task DAG.
 
-    If `modify_feedback` is present, treats this as a revision
-    of an existing plan incorporating user feedback.
+    Uses a ReAct loop with MCP tools to search for real venue data.
     """
     intent = state["intent"]
     modify_feedback = state.get("modify_feedback", "")
     existing_plan = state.get("plan")
 
-    # Build a rich intent description for the planner
+    # Build intent description
     parts = [f"Activity: {intent.activity}"]
     if intent.date:
         parts.append(f"Date: {intent.date}")
@@ -389,14 +415,20 @@ async def decompose_and_plan(state: AgentState) -> dict:
         plan_json = existing_plan.model_dump_json(indent=2, exclude_none=True)
         lines.append(f"\n*** REVISION REQUEST ***")
         lines.append(f'The user wants to modify the plan: "{modify_feedback}"')
-        lines.append(f"Revise the following plan to incorporate this change:")
+        lines.append("Revise the following plan to incorporate this change:")
         lines.append(plan_json)
         lines.append("Keep everything the user didn't ask to change.")
 
     user_prompt = "\n".join(lines)
 
-    agent = Agent(_make_model(), system_prompt=DECOMPOSE_PROMPT)
-    text = await _run_agent(agent, user_prompt, "decompose_and_plan")
+    # Run ReAct loop with MCP tools
+    async with mcp_session() as (tools, server_id):
+        llm = make_model(temperature=0.7)
+        text = await react_loop(
+            llm, tools, DECOMPOSE_PROMPT, user_prompt,
+            "decompose_and_plan", stream=False,
+        )
+
     data = _extract_json(text)
     data = _normalize_plan(data)
     clean = _strip_nulls(data)
@@ -440,10 +472,8 @@ async def verify_plan(state: AgentState) -> dict:
     """Node 3: Validate plan against user intent."""
     intent = state["intent"]
     plan = state["plan"]
-
     plan_json = plan.model_dump_json(indent=2, exclude_none=True)
 
-    # Build compact intent summary for verifier
     i_lines = [f"Activity: {intent.activity}"]
     if intent.date:
         i_lines.append(f"Date: {intent.date}")
@@ -478,17 +508,17 @@ async def verify_plan(state: AgentState) -> dict:
     intent_text = "\n  ".join(i_lines)
     user_prompt = f"User intent:\n  {intent_text}\n\nPlan to verify:\n{plan_json}"
 
-    agent = Agent(_make_model(), system_prompt=VERIFY_PROMPT)
-    text = await _run_agent(agent, user_prompt, "verify_plan")
+    llm = make_model(temperature=0.3)
+    messages = [
+        SystemMessage(content=VERIFY_PROMPT),
+        HumanMessage(content=user_prompt),
+    ]
+    text = await llm_invoke(llm, messages, "verify_plan", stream=True)
     data = _extract_json(text)
     verification = Verification.model_validate(data)
 
     iterations = state.get("plan_iterations", 0) + 1
-
-    return {
-        "verification": verification,
-        "plan_iterations": iterations,
-    }
+    return {"verification": verification, "plan_iterations": iterations}
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -538,8 +568,12 @@ async def adjust_plan(state: AgentState) -> dict:
 
     user_prompt = "\n".join(parts)
 
-    agent = Agent(_make_model(), system_prompt=ADJUST_PROMPT)
-    text = await _run_agent(agent, user_prompt, "adjust_plan")
+    llm = make_model(temperature=0.5)
+    messages = [
+        SystemMessage(content=ADJUST_PROMPT),
+        HumanMessage(content=user_prompt),
+    ]
+    text = await llm_invoke(llm, messages, "adjust_plan", stream=True)
     data = _extract_json(text)
     data = _normalize_plan(data)
     clean = _strip_nulls(data)
@@ -572,15 +606,7 @@ def _format_plan(plan: Plan) -> str:
 
 
 async def present_to_user(state: AgentState) -> dict:
-    """Node 4: Display plan to user and wait for decision.
-
-    Uses LangGraph interrupt() — the graph pauses here. The caller
-    displays the plan, collects user choice, and resumes with Command.
-
-    Resume value can be:
-      "confirm" / "cancel"  → simple string
-      {"action": "modify", "feedback": "..."}  → dict with user feedback
-    """
+    """Node 4: Display plan and wait for user decision (HITL interrupt)."""
     plan = state["plan"]
 
     decision = interrupt({
@@ -595,7 +621,7 @@ async def present_to_user(state: AgentState) -> dict:
         return {
             "next_action": action,
             "modify_feedback": feedback,
-            "plan_iterations": 0,  # user-driven change resets counter
+            "plan_iterations": 0,
         }
     return {"next_action": decision}
 
@@ -604,24 +630,15 @@ async def present_to_user(state: AgentState) -> dict:
 # Node 5: book_worker  (fan-out via Send)
 # ═══════════════════════════════════════════════════════════════════════
 
-import hashlib
-import random
-
 MAX_RETRIES = 2
 
 
 def _simulate_booking(task: SubTask, retry_count: int = 0) -> BookingResult:
-    """Simulate a booking API call with deterministic mixed results.
-
-    In production this would be a real API call. For now, uses
-    a hash of the task id to produce repeatable pass/fail outcomes.
-    """
+    """Simulate a booking API call with deterministic mixed results."""
     seed = int(hashlib.md5(task.id.encode()).hexdigest()[:8], 16)
-    rng = random.Random(seed + retry_count * 1000)  # retry shifts the outcome
-
+    rng = random.Random(seed + retry_count * 1000)
     roll = rng.random()
 
-    # Compensation/cancel tasks always succeed
     if "cancel" in task.id.lower():
         return BookingResult(
             task_id=task.id, status="success",
@@ -629,21 +646,18 @@ def _simulate_booking(task: SubTask, retry_count: int = 0) -> BookingResult:
         )
 
     if roll < 0.15:
-        # 15% transient failure (timeout, network)
         return BookingResult(
             task_id=task.id, status="failed",
             error="Network timeout after 30s",
             error_type="transient", retries=retry_count,
         )
     elif roll < 0.25:
-        # 10% recoverable failure (sold out, unavailable)
         return BookingResult(
             task_id=task.id, status="failed",
             error=f"Sorry, '{task.target}' is fully booked / sold out",
             error_type="recoverable", retries=retry_count,
         )
     else:
-        # 75% success
         return BookingResult(
             task_id=task.id, status="success",
             order_id=f"ORD-{task.id[:8].upper()}-{abs(hash(task.id)) % 10000:04d}",
@@ -651,12 +665,7 @@ def _simulate_booking(task: SubTask, retry_count: int = 0) -> BookingResult:
 
 
 async def book_worker(state: AgentState) -> dict:
-    """Node 5: Execute a single booking task (invoked via Send fan-out).
-
-    Receives `plan`, `current_task_id`, and `current_retry_count` set
-    by Send.arg. Looks up the task in the plan, simulates the booking,
-    and returns a partial booking result for merge-back.
-    """
+    """Node 5: Execute a single booking task (invoked via Send fan-out)."""
     task_id = state.get("current_task_id", "")
     plan = state.get("plan")
     retry_count = state.get("current_retry_count", 0)
@@ -727,19 +736,18 @@ async def handle_failures(state: AgentState) -> dict:
     plan = state["plan"]
 
     has_retryable = False
-    messages: list[str] = []
+    msgs: list[str] = []
 
     for task_id, result in bookings.items():
         if result.status != "failed":
             continue
 
         if result.error_type == "transient" and result.retries < MAX_RETRIES:
-            messages.append(f"🔄 {task_id}: transient error, will retry "
-                            f"(attempt {result.retries + 1}/{MAX_RETRIES})")
+            msgs.append(f"🔄 {task_id}: transient error, will retry "
+                        f"(attempt {result.retries + 1}/{MAX_RETRIES})")
             has_retryable = True
 
         elif result.error_type == "recoverable":
-            # Compensate related successful bookings
             task = next((st for st in plan.sub_tasks if st.id == task_id), None)
             if task and task.compensatory:
                 comp_id = task.compensatory
@@ -747,12 +755,11 @@ async def handle_failures(state: AgentState) -> dict:
                     task_id=comp_id, status="compensated",
                     error=f"Auto-compensated due to failure of {task_id}",
                 )
-            messages.append(f"🔙 {task_id}: recoverable error, "
-                            f"compensating up to {result.retries}")
+            msgs.append(f"🔙 {task_id}: recoverable error, "
+                        f"compensating up to {result.retries}")
 
         else:
-            # Fatal or exhausted retries
-            messages.append(f"🚫 {task_id}: fatal error — {result.error}")
+            msgs.append(f"🚫 {task_id}: fatal error — {result.error}")
 
     next_action = "retry" if has_retryable else "notify"
 
@@ -760,7 +767,7 @@ async def handle_failures(state: AgentState) -> dict:
         "bookings": bookings,
         "retry_count": state.get("retry_count", 0) + 1,
         "next_action": next_action,
-        "messages": [{"role": "assistant", "content": "\n".join(messages)}],
+        "messages": [{"role": "assistant", "content": "\n".join(msgs)}],
     }
 
 
@@ -799,7 +806,7 @@ async def summarize_result(state: AgentState) -> dict:
             lines.append(f"    ❌ {r.task_id} — {r.error}")
 
     if not failed:
-        lines.append(f"\n  Enjoy your trip! 🎉")
+        lines.append("\n  Enjoy your trip! 🎉")
 
     return {
         "messages": [{"role": "assistant", "content": "\n".join(lines)}],
@@ -837,20 +844,9 @@ async def notify_user(state: AgentState) -> dict:
 # Edge routing functions
 # ═══════════════════════════════════════════════════════════════════════
 
-
-MAX_PLAN_ITERATIONS = 4  # initial + up to 3 adjust cycles
-MAX_RETRY_TOTAL = 3      # max total retry rounds across all tasks
-
-
-def route_after_clarify(state: AgentState) -> str:
-    """Edge A: Route based on intent completeness."""
-    action = state.get("next_action", "reject")
-    if action == "decompose_and_plan":
-        return "decompose_and_plan"
-    elif action == "clarify":
-        return "clarify"
-    else:
-        return "reject"
+MAX_CLARIFY_ITERATIONS = 6
+MAX_PLAN_ITERATIONS = 4
+MAX_RETRY_TOTAL = 3
 
 
 def route_after_verify(state: AgentState) -> str:
@@ -871,11 +867,7 @@ def route_after_verify(state: AgentState) -> str:
 
 
 def route_after_present(state: AgentState):
-    """Edge C: Route based on user decision after plan review.
-
-    Returns list[Send] for confirm (fan-out to book_worker),
-    or a string destination for modify/cancel.
-    """
+    """Edge C: Route based on user decision after plan review."""
     action = state.get("next_action", "cancel")
     if action == "confirm":
         plan = state["plan"]
@@ -884,7 +876,7 @@ def route_after_present(state: AgentState):
             if st.type == "book" and "cancel" not in st.id.lower()
         ]
         if not book_tasks:
-            return "summarize"  # nothing to execute; skip to summary
+            return "summarize"
         return [
             Send("book_worker", {
                 "plan": plan,
@@ -911,11 +903,7 @@ def route_after_exec(state: AgentState) -> str:
 
 
 def route_after_handle_failures(state: AgentState):
-    """Edge E: Route after failure handling.
-
-    Returns list[Send] for retry (fan-out only failed transient tasks),
-    or "notify" to escalate to user.
-    """
+    """Edge E: Route after failure handling."""
     action = state.get("next_action", "notify")
     retry_count = state.get("retry_count", 0)
 

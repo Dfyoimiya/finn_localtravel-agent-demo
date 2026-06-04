@@ -72,7 +72,7 @@ START → clarify_intent ─┬→ decompose_and_plan → verify_plan
                        All terminal → END ◄────────────────────┘
 ```
 
-- `clarify_intent` — extracts structured `Intent` via JSON-formatted LLM output
+- `clarify_intent` — extracts structured `Intent` via JSON-formatted LLM output. Uses `Command(goto=...)` for LLM-driven routing: `plan`→decompose_and_plan, `clarify`→END, `reject`→reject. No separate edge function needed.
 - `simple_answer` — answers non-trip questions (reserved, currently unused edge)
 - `decompose_and_plan` — decomposes intent into a `Plan` (sub-task DAG). Handles fresh plans and revision (modify flow passes existing plan + feedback)
 - `verify_plan` — evaluates plan against 5 dimensions; outputs `Verification` (score 0-1, issues[], status pass/fix/reject)
@@ -129,7 +129,7 @@ def route_after_handle_failures(state):
 
 | Model | Key fields |
 |---|---|
-| `Intent` | goal, date, location, budget, preferences, is_complete |
+| `Intent` | activity, date, start_location, scenario, start_time, duration_hours, area, radius_km, party_size, party_members[], budget_total, budget_per_person, hard_constraints[], preferences[], missing_critical[], follow_up_question |
 | `SubTask` | id, type (search/compare/book), target, dependencies, compensatory |
 | `Plan` | sub_tasks[], total_cost_estimate, notes |
 | `Verification` | score (0-1), issues[], status (pass/fix/reject) |

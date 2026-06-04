@@ -144,6 +144,7 @@ class AgentState(MessagesState):
     plan: Plan | None
     verification: Verification | None
     plan_iterations: int
+    clarify_iterations: int
     next_action: str
     modify_feedback: str
 

@@ -30,7 +30,7 @@ The architecture is **LangGraph DAG (orchestration) + PydanticAI ReAct (per-node
                                   │
                                   ▼
                          ┌─────────────────┐
-                         │  clarify_intent  │  Node 1
+                         │  clarify_intent │  Node 1
                          └────────┬────────┘
                                   │
                              ┌────┴────┐

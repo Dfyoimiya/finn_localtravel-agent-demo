@@ -70,7 +70,6 @@ from finn.nodes import (
     notify_user,
     present_to_user,
     reject,
-    route_after_clarify,
     route_after_exec,
     route_after_handle_failures,
     route_after_present,
@@ -103,11 +102,9 @@ def create_graph():
     # ── Edges ──
     graph.set_entry_point("clarify_intent")
 
-    # After clarify → plan / ask-more / reject
-    graph.add_conditional_edges(
-        "clarify_intent", route_after_clarify,
-        {"decompose_and_plan": "decompose_and_plan", "clarify": END, "reject": "reject"},
-    )
+    # clarify_intent uses Command(goto=...) for routing.
+    # Fallback edge in case Command is not returned.
+    graph.add_edge("clarify_intent", END)
 
     # Plan → Verify
     graph.add_edge("decompose_and_plan", "verify_plan")

@@ -5,10 +5,12 @@ description = "Local short-trip planning agent — DAG + ReAct hybrid architectu
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "pydantic-ai-slim[openai]>=1.0.0",
+    "langchain>=0.3.0",
+    "langchain-openai>=0.3.0",
     "langgraph>=0.6.0",
     "langchain-core>=0.3.0",
     "openai>=1.0.0",
+    "mcp>=1.0.0",
     "python-dotenv>=1.0.0",
     "prompt-toolkit>=3.0.52",
     "rich>=15.0.0",
