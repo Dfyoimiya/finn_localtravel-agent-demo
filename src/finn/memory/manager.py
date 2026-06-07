@@ -163,7 +163,7 @@ class MemoryManager:
 
         # Update saved party members if new ones appeared
         if not profile.saved_party_members and trip.party_size and trip.party_size > 1:
-            # Party members are stored in the Intent, not in TripMemory
+            # Party members are stored in the ExtractResult, not in TripMemory
             pass  # Handled at the call site in cli.py
 
         # Persist trip file

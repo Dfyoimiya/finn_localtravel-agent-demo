@@ -21,7 +21,7 @@ import os
 import re
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Union
 
 from langchain_core.tools import BaseTool
 from pydantic import Field, create_model
@@ -67,12 +67,15 @@ def _tool_allowed(tool_name: str, server_id: str) -> bool:
 # JSON Schema → Pydantic args_schema
 # ═══════════════════════════════════════════════════════════════════════
 
-# MCP tools receive all arguments as strings via JSON-RPC.
-# Use str for everything to avoid type coercion issues (e.g. model sends
-# {"type": 1} but schema expects {"type": "1"}).
-_TYPE_MAP: dict[str, type] = {
-    "string": str, "number": str, "integer": str,
-    "boolean": str, "array": str, "object": str,
+# MCP tools receive all arguments as strings via JSON-RPC, but LLMs often
+# send numeric values as int/float. Accept both and convert to str in _arun.
+_TYPE_MAP: dict[str, Any] = {
+    "string": Union[str, int, float],
+    "number": Union[str, int, float],
+    "integer": Union[str, int, float],
+    "boolean": Union[str, int],   # LLMs may send 0/1
+    "array": str,
+    "object": str,
 }
 
 
@@ -83,7 +86,7 @@ def _build_args_schema(schema: dict, name: str) -> type:
     fields: dict[str, Any] = {}
 
     for field_name, prop in props.items():
-        py_type = _TYPE_MAP.get(prop.get("type", "string"), str)
+        py_type = _TYPE_MAP.get(prop.get("type", "string"), Union[str, int, float])
         desc = prop.get("description", "")
         if field_name in required:
             fields[field_name] = (py_type, Field(description=desc))
@@ -110,10 +113,12 @@ class _MCPTool(BaseTool):
         raise NotImplementedError("Use async")
 
     async def _arun(self, **kwargs) -> str:
+        # Coerce all args to strings for JSON-RPC compatibility.
+        # LLMs may pass int/float for numeric params (e.g. type=1 instead of type="1").
+        string_kwargs = {k: str(v) if not isinstance(v, str) else v for k, v in kwargs.items()}
         try:
-            result = await self.session.call_tool(self.name, kwargs)
+            result = await self.session.call_tool(self.name, string_kwargs)
             if hasattr(result, "content") and result.content:
-                # MCP CallToolResult
                 texts = []
                 for c in result.content:
                     if hasattr(c, "text"):
@@ -134,6 +139,12 @@ def _make_langchain_tools(session, server_id: str) -> list[BaseTool]:
 # ═══════════════════════════════════════════════════════════════════════
 # MCP session context manager
 # ═══════════════════════════════════════════════════════════════════════
+
+# NOTE: Sessions are NOT cached across nodes because the MCP SDK's
+# streamable_http_client uses anyio cancel scopes tied to a specific
+# asyncio Task. LangGraph may run each node in its own Task, so reusing
+# a session across nodes causes "Attempted to exit cancel scope in a
+# different task" errors. Each node opens/closes its own connection.
 
 
 @asynccontextmanager

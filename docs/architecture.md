@@ -1,12 +1,12 @@
-# Finn Agent — DAG Workflow Design
+# Finn Agent — Architecture Design
 
 ## Overview
 
-Finn is a **local short-trip planning & execution agent**. It takes natural language
-input, proactively researches options, plans an executable itinerary, presents it to
-the user for approval, and then **completes the bookings/orders on the user's behalf**.
+Finn is a **local short-trip planning & execution agent** that takes natural language
+input, researches POIs, plans an executable itinerary, presents it to the user for
+approval, and completes bookings on the user's behalf.
 
-The architecture is **LangGraph DAG (orchestration) + PydanticAI ReAct (per-node execution)**.
+The architecture is **LangGraph DAG (orchestration) + per-node LLM ReAct loop**.
 
 ---
 
@@ -17,398 +17,354 @@ The architecture is **LangGraph DAG (orchestration) + PydanticAI ReAct (per-node
 | **Plan-Execute-Verify-Replan** | VMAO (arXiv:2603.11445) | Cyclic verification with correction loops, not one-shot planning |
 | **Route first, plan lazy** | "Two-Speed" Architecture | Classify intent cheaply; only run heavy planning for multi-step tasks |
 | **User approves execution, not planning** | AutoGen / CrewAI consensus | Show the plan; user clicks approve; agent executes |
-| **Saga compensation** | Conductor / Temporal pattern | Every side-effect node has a registered compensating node |
-| **Sync checkpointing** | LangGraph | Persist state before every external call; resume from crash |
-| **Fan-out / Fan-in** | LLMCompiler (arXiv:2312.04511) | Independent sub-tasks run in parallel, results aggregated |
+| **Saga compensation** | Conductor / Temporal pattern | Every book task has a registered compensatory cancel task |
+| **Sync checkpointing** | LangGraph MemorySaver | Persist state every superstep; resume from crash |
+| **Fan-out / Fan-in** | LLMCompiler (arXiv:2312.04511) | Independent sub-tasks run in parallel via `Send()`, results merged via reducer |
 
 ---
 
 ## DAG Topology
 
 ```
-                                START
-                                  │
-                                  ▼
-                         ┌─────────────────┐
-                         │  clarify_intent │  Node 1
-                         └────────┬────────┘
-                                  │
-                             ┌────┴────┐
-                             │  route  │  Edge A
-                             └────┬────┘
-                    ┌─────────────┼─────────────┐
-                    ▼             ▼             ▼
-               ┌────────┐  ┌─────────────┐  ┌────────┐
-               │ simple │  │ decompose   │  │ reject │  Node 2a/2b/2c
-               │ answer │  │ _and_plan   │  │        │
-               └───┬────┘  └──────┬──────┘  └───┬────┘
-                   │              │              │
-                   ▼              ▼              ▼
-                RESPOND     ┌─────────┐      RESPOND
-                            │ verify  │  Node 3
-                            │ _plan   │
-                            └────┬────┘
-                                 │
-                            ┌────┴────┐
-                            │  pass?  │  Edge B
-                            └────┬────┘
-                           no    │ yes
-                            │    ▼
-                            │ ┌──────────────┐
-                            │ │ present_to   │  Node 4  ★ HITL interrupt
-                            │ │ _user        │
-                            │ └──────┬───────┘
-                            │        │
-                            │   ┌────┴────┐
-                            │   │ approve?│  Edge C
-                            │   └────┬────┘
-                            │   no   │ yes
-                            │    │   ▼
-                            │    │ ┌────────────────┐
-                            │    │ │ execute        │  Node 5  ★ fan-out → fan-in
-                            │    │ │ _bookings      │
-                            │    │ │ ┌────────────┐ │
-                            │    │ │ │ book_* × N │ │  (parallel ReAct agents)
-                            │    │ │ └────────────┘ │
-                            │    │ └───────┬────────┘
-                            │    │         │
-                            │    │    ┌────┴────┐
-                            │    │    │ verify  │  Edge D
-                            │    │    │ _exec   │
-                            │    │    └────┬────┘
-                            │    │         │
-                            │    │    ┌────┴──────────┐
-                            │    │    │                 │
-                            │    │  all_ok         partial_fail
-                            │    │    │                 │
-                            │    │    ▼                 ▼
-                            │    │ ┌──────────┐  ┌──────────────┐
-                            │    │ │summarize │  │ handle       │  Node 6a/6b
-                            │    │ │_result   │  │ _failures    │
-                            │    │ └────┬─────┘  └──────┬───────┘
-                            │    │      │               │
-                            │    │      ▼          ┌────┴────┐
-                            │    │   RESPOND       │retryable?│ Edge E
-                            │    │                 └────┬────┘
-                            │    │              yes     │ no
-                            │    │               │      ▼
-                            │    │               │   NOTIFY
-                            │    │               │   _USER
-                            │    │               │      │
-                            │    │               │      ▼
-                            │    │               │    RESPOND
-                            │    │               │
-                            │    │               ▼
-                            │    │          execute_bookings
-                            │    │          (retry failed only)
-                            │    │               │
-                            │    └───────────────┘
-                            │
-                            ▼
-                      ┌──────────┐
-                      │ adjust   │  Node 7
-                      │ _plan    │
-                      └────┬─────┘
-                           │
-                           ▼
-                       verify_plan
-                       (re-loop)
+                              START
+                                │
+                                ▼
+                       ┌─────────────────┐
+                       │  clarify_intent │  ★ LLM-driven routing via Command(goto=...)
+                       └────────┬────────┘
+                                │
+                    ┌───────────┼───────────┐
+                    ▼           ▼           ▼
+                "clarify"    "plan"     "reject"
+                    │           │           │
+                    ▼           ▼           ▼
+                  END    ┌───────────┐  ┌────────┐
+                         │context_   │  │ reject │ → END
+                         │agent      │  └────────┘
+                         └─────┬─────┘
+                               │
+                               ▼
+                       ┌───────────────┐
+                       │formulate_     │  LLM: design search strategy
+                       │search         │
+                       └───────┬───────┘
+                               │
+                               ▼
+                       ┌───────────────┐
+                       │execute_       │  MCP batch search (≤2 rounds)
+                       │category_search│ ←── loop back if coverage insufficient
+                       └───────┬───────┘
+                               │
+                               ▼
+                       ┌───────────────┐
+                       │multi_agent_   │  2 LLM agents in parallel:
+                       │plan           │  constraint_satisfaction + spatio_temporal
+                       └───────┬───────┘
+                               │
+                               ▼
+                       ┌───────────────┐
+                       │plan_fusion    │  LLM weighted voting across agent plans
+                       └───────┬───────┘
+                               │
+                               ▼
+                       ┌───────────────┐
+                       │present_to_user│  ★ HITL interrupt()
+                       └───────┬───────┘
+                               │
+                    ┌──────────┼──────────┐
+                    ▼          ▼          ▼
+                "confirm"  "modify"   "cancel"
+                    │          │          │
+                    ▼          ▼          ▼
+            ┌──────────┐ ┌──────────┐   END
+            │fan_out_  │ │qa_check  │
+            │bookings  │ │(≤3 loops)│──→ present_to_user
+            └────┬─────┘ └──────────┘
+                 │
+                 ▼  Send() fan-out (parallel per sub-task)
+            ┌──────────┐ ┌──────────┐ ┌──────────┐
+            │book_     │ │book_     │ │book_     │  ...
+            │worker    │ │worker    │ │worker    │
+            └────┬─────┘ └────┬─────┘ └────┬─────┘
+                 │            │            │
+                 └────────────┼────────────┘
+                              ▼  (reducer merges bookings dict)
+                       ┌───────────────┐
+                       │verify_execution│  classify: done / partial / failed
+                       └───────┬───────┘
+                               │
+                    ┌──────────┼──────────┐
+                    ▼          ▼          ▼
+                  "done"   "partial"   "failed"
+                    │     / "failed"      │
+                    ▼          └────┐     │
+            ┌──────────┐            ▼     │
+            │summarize │    ┌──────────────┐
+            │_result   │    │handle_failures│
+            └────┬─────┘    └──────┬───────┘
+                 │                 │
+                 ▼         ┌───────┴───────┐
+                END    "retry"         "notify"
+                           │               │
+                           ▼               ▼
+                    Send() back to   ┌──────────┐
+                    book_worker      │notify_user│ → END
+                                     └──────────┘
 ```
+
+**Key routing notes:**
+- `clarify_intent` uses `Command(goto=...)` for LLM-driven routing (plan/clarify/reject). No separate edge function.
+- `route_fanout` returns `list[Send("book_worker", {...})]` for parallel execution — implemented entirely in the conditional edge, not in a node.
+- No LLM calls in the execution path (`fan_out_bookings` → `book_worker` → `verify_execution` → `handle_failures` → `summarize_result`); all programmatic logic.
 
 ---
 
-## Node Specifications
+## Phase 1: Extract — Intent Clarification
 
-### Node 1: `clarify_intent` — Disambiguation & Information Gathering
+### Node: `clarify_intent`
+
+Takes raw user input, extracts structured intent via LLM JSON-formatted output.
 
 | Item | Detail |
 |---|---|
-| **Type** | ReAct agent (can ask user follow-up questions) |
-| **Input** | Raw user natural language |
-| **Output** | Structured intent: `{goal, date, location, budget, preferences, missing_fields}` |
-| **Behavior** | If information is missing (no date, no party size), actively ask the user. Loop until key fields are collected or user declines to provide more. |
-| **Exit condition** | Required fields complete OR user says "whatever" OR 3 rounds of follow-up reached |
-
-**Rationale:** Trip planning inherently requires structured parameters (date, location, party size, budget). Collect them upfront so downstream nodes never need to ask again.
+| **Input** | User message + conversation history |
+| **Output** | `ExtractResult`: `UserIntent` + `UserRequirements` + `HardConstraints` + `SoftConstraints` + `GroupProfile` + `TimeWindow` + `GeoConstraint` + `ChainTemplate` |
+| **Routing** | LLM sets `route` field: `plan` → continue, `clarify` → END (follow-up), `reject` → capability boundary |
+| **Multi-turn** | `apply_update()` merges incremental updates across turns. `MAX_CLARIFY_ITERATIONS` forces routing to `plan` or `reject` on exhaustion. |
+| **Fallback** | JSON parse failure → `route="clarify"` with generic follow-up |
 
 ---
 
-### Edge A: `route` — Intent Classification
+## Phase 2: Context — Weather & Geocoding
 
-```
-if intent is simple Q&A (weather, reviews, distance):
-    → simple_answer
-elif intent is trip planning (arrange, book, plan an outing):
-    → decompose_and_plan
-else:
-    → reject (inform user of capability boundaries)
-```
+### Node: `context_agent`
 
-Uses rule-based matching on the `goal` field from `clarify_intent`. No LLM needed for routing.
-
----
-
-### Node 2b: `decompose_and_plan` — Task Decomposition & Planning
-
-The core planning node. Takes structured intent, outputs an executable sub-task DAG.
+Fetches environmental context before planning.
 
 | Item | Detail |
 |---|---|
-| **Type** | ReAct agent + tool calls |
-| **Tools** | Search venues, check hours, check pricing, check routes, check weather |
-| **Input** | `{goal, date, location, budget, preferences}` |
-| **Output** | `Plan { sub_tasks[], dependencies, estimated_cost, alternatives }` |
+| **Geocoding** | Resolves user location to lat/lng via Amap `geo` MCP tool |
+| **Weather** | Fetches forecast via Amap `weather` MCP tool |
+| **Fallback** | MCP failures → `weather=None`, downstream skips weather-dependent logic |
 
-**Sub-task structure:**
+---
+
+## Phase 3: Search — POI Discovery
+
+### Node: `formulate_search`
+
+LLM designs a search strategy: what categories to query, what keywords per category, what radius.
+
+### Node: `execute_category_search`
+
+Executes the strategy via parallel MCP calls (`batch_around_search` + `batch_search_detail`).
+
+- Maximum **2 rounds**: if first-round coverage is insufficient, loops back to `formulate_search` via `Command(goto=...)`.
+- Output: `category_pools` — dict of `POICategoryPool` (keyed by macro-category: dining, scenic, shopping, etc.)
+
+---
+
+## Phase 4: Plan — Dual-Agent + Fusion
+
+### Node: `multi_agent_plan`
+
+Two LLM agents run in parallel via `asyncio.gather`:
+
+| Agent | Strategy | Optimization Target |
+|---|---|---|
+| `constraint_satisfaction` | Hard-constraint-first | Max constraint coverage + preference match |
+| `spatio_temporal` | Geography-first | Min transit waste, max play time, cluster affinity |
+
+Each outputs an `AgentPlan` (nodes with slot → poi_id → times → transit → cost → reasoning). If fewer than 2 succeed, fallback to single-agent result.
+
+### Node: `plan_fusion`
+
+LLM performs weighted voting across both agent plans per time-slot:
+
+- **Consensus** (same POI) → high-weight adoption
+- **Constraint conflict** → lean toward constraint agent
+- **Spatial conflict** → lean toward spatio-temporal agent
+- **Score conflict** → composite: α·rating + β·distance + γ·budget
+
+Outputs `FusionResult` containing a unified `Plan` (SubTask DAG). LLM failure → `_fallback_fusion` uses Agent 1's plan with score penalty.
+
+### Node: `qa_check`
+
+LLM optimization pass verifying 4 dimensions:
+
+1. **Time feasibility** — durations, transit realism, meal timing
+2. **Constraint satisfaction** — budget, diet, child safety, must-visits
+3. **Diversity** — no duplicate POI types
+4. **Weather adaptation** — indoor preference when rainy
+
+Fixes issues by substituting POIs from candidate pools. `modify_count` cap at 3.
+
+---
+
+## Phase 5: Present — HITL Gate
+
+### Node: `present_to_user`
+
+| Item | Detail |
+|---|---|
+| **Mechanism** | LangGraph `interrupt()` pauses execution |
+| **Resume** | `Command(resume=<choice>)` with confirm/modify/cancel |
+| **Display** | Formatted plan cards (POI name, time, cost, transit, notes) |
+| **Cascading HITL** | Modify → QA → present again; CLI loops until graph completes |
+
+---
+
+## Phase 6: Execute — Fan-out Booking
+
+### Node: `fan_out_bookings`
+
+Transition node. The actual fan-out happens in the **conditional edge** `route_fanout`:
+
 ```python
-class SubTask:
-    id: str
-    type: Literal["search", "compare", "book"]
-    target: str          # e.g. "dinner" | "movie_ticket" | "taxi"
-    dependencies: list[str]  # IDs of sub-tasks this one depends on
-    params: dict
-    compensatory: str | None  # ID of compensating task
+def route_fanout(state):
+    return [Send("book_worker", {
+        "plan": plan,
+        "current_task_id": st.id,
+        "current_retry_count": 0,
+    }) for st in plan.sub_tasks if st.type == "book" and "cancel" not in st.id.lower()]
 ```
 
-**Constraints:**
-- Maximum 8 sub-tasks (prevents explosion)
-- `search` tasks have no dependencies; can run in parallel
-- `book` tasks depend on their corresponding `search` completing
-- Every `book` task must have a `compensatory` (cancel/refund)
+### Node: `book_worker`
 
----
+Single-task worker. Each instance receives `current_task_id` + `current_retry_count` from `Send.arg`. Runs a **simulated booking** (deterministic hash-based: 82% success, 10% transient timeout, 8% recoverable sold-out). Results merge back into `state.bookings` via custom `_merge_bookings` reducer.
 
-### Node 3: `verify_plan` — Plan Validation
+### Node: `verify_execution`
 
-| Item | Detail |
-|---|---|
-| **Type** | Pure LLM evaluation (no tool calls). Use a different model to avoid self-consistency bias. |
-| **Input** | `Plan + UserIntent` |
-| **Output** | `Verification { score: 0-1, issues: [...], status: pass | fix | reject }` |
+Classifies all `BookingResult`s into buckets: `succeeded` / `failed`. Computes `execution_status`:
+- All success → `"done"`
+- Partial success → `"partial"`
+- All failed → `"failed"`
 
-**Validation dimensions:**
+### Node: `handle_failures`
 
-| Dimension | Check |
-|---|---|
-| Temporal feasibility | Do sub-task times conflict? Are transit times realistic? |
-| Budget feasibility | Does the total fall within budget? |
-| Logical consistency | Dinner → movie: does the movie start after dinner ends? |
-| Completeness | Are all user requirements covered? Anything missing? |
-| Business hours | Are booked venues actually open at the planned time? |
+Three-tier classification per failed booking:
 
----
+| Error Type | Example | Action |
+|---|---|---|
+| **transient** | Network timeout, API rate limit | Retry (max 2), else escalate to fatal |
+| **recoverable** | Venue full / sold out | Run `compensatory` cancel task → mark compensated |
+| **fatal** | Permanent error, exhausted retries | Escalate to `notify_user` |
 
-### Edge B: `verify_plan` Routing
+Retry routing: `route_after_handle_failures` returns `list[Send("book_worker", ...)]` for transient tasks.
 
-```
-if status == "pass" AND score >= 0.7:
-    → present_to_user
-else:
-    → adjust_plan (carrying the issues list)
-```
+### Node: `summarize_result`
 
----
+Final report: confirmed bookings + compensated cancellations + unresolved failures.
 
-### Node 4: `present_to_user` — Plan Confirmation ★ HITL
+### Node: `notify_user`
 
-| Item | Detail |
-|---|---|
-| **Type** | LangGraph `interrupt()` static breakpoint |
-| **Behavior** | Format the plan for display, pause execution, wait for user action |
-| **User actions** | Confirm / Modify / Cancel |
-
-**Example display format:**
-```
-Your Weekend Plan
-
-Saturday June 7
-  12:00  Lunch @ Sushi Ichi (reservations available)  — ¥150/person
-  14:30  Movie "XXX" @ MixC Cinema                     — ¥60/person
-  17:00  Coffee @ %Arabica                             — ¥40/person
-
-Total: ¥250/person × 2 people = ¥500
-
-[Confirm] [Modify] [Cancel]
-```
-
----
-
-### Edge C: `present_to_user` Routing
-
-```
-if confirmed:
-    → execute_bookings
-elif modify:
-    → adjust_plan (carrying modification requests)
-else:
-    → END (no side effects)
-```
-
----
-
-### Node 5: `execute_bookings` — Parallel Execution ★
-
-Fan-out → fan-in pattern. Each booking task runs as an independent ReAct agent.
-
-```
-                    execute_bookings
-                           │
-              ┌────────────┼────────────┐
-              ▼            ▼            ▼
-         book_table   book_ticket   book_activity
-         (ReAct)      (ReAct)       (ReAct)
-              │            │            │
-              └────────────┼────────────┘
-                           ▼
-                      aggregate
-```
-
-| Item | Detail |
-|---|---|
-| **Implementation** | LangGraph `Send()` API, one `Send` per sub-task |
-| **Each book_* internally** | PydanticAI ReAct loop: navigate → select → fill → submit → confirm |
-| **Parallelism** | All independent book tasks execute concurrently |
-| **Compensation** | Each `book_*` has a registered `cancel_*` node triggered on failure |
-| **Safety** | Every external call carries an `idempotency_key` |
-
----
-
-### Edge D: `verify_execution` Routing
-
-```
-if all succeeded:
-    → summarize_result
-elif partial success AND retryable:
-    → handle_failures → execute_bookings (retry failed only)
-elif all failed OR non-retryable:
-    → notify_user (report failure, auto-cancel succeeded items)
-```
-
----
-
-### Node 6b: `handle_failures` — Failure Recovery
-
-| Failure Type | Strategy |
-|---|---|
-| Network timeout / rate limit | Exponential backoff retry (max 3) |
-| Venue full / sold out | Trigger `alternatives` query for substitutes |
-| Payment failed | Notify user, pause for input |
-| Permission / parameter error | Immediate abort, compensate all succeeded orders |
-
----
-
-### Edge E: `handle_failures` Routing
-
-```
-if retryable:
-    → execute_bookings (retry failed tasks only)
-else:
-    → notify_user → END
-```
-
----
-
-### Node 7: `adjust_plan` — Plan Correction
-
-Receives `issues` from `verify_plan` or modification requests from user. Adjusts the plan and re-enters `verify_plan`.
-
-| Adjustment Type | Strategy |
-|---|---|
-| `verify_plan` failed | Targeted fix based on issues (change time, venue, order) |
-| User modification | Merge user changes → re-plan affected sub-tasks |
-| 3rd attempt still fails | Abort auto-correction; present best partial plan to user |
-
-**Loop limit:** `decompose → verify → adjust` loops at most 3 times to prevent infinite cycles.
+Escalation endpoint for non-retryable failures. Reports what failed and prompts user to retry manually.
 
 ---
 
 ## State Design
 
-```python
-class Intent(TypedDict):
-    goal: str
-    date: str | None
-    location: str | None
-    budget: float | None
-    preferences: list[str]
-    missing_fields: list[str]
+`AgentState` extends LangGraph `MessagesState` (inherits `messages` with `add_messages` reducer).
 
-class SubTask(TypedDict):
+### Extract Phase
+
+| Field | Type | Description |
+|---|---|---|
+| `extract_result` | `ExtractResult` | Aggregated intent (updated incrementally across clarify turns) |
+| `clarify_iterations` | `int` | Guard against infinite clarify loop |
+| `user_coords` | `str \| None` | Resolved "lng,lat" from geocoding |
+
+### Context Phase
+
+| Field | Type | Description |
+|---|---|---|
+| `weather` | `WeatherContext \| None` | Forecast data; `None` if MCP call failed |
+
+### Search Phase
+
+| Field | Type | Description |
+|---|---|---|
+| `search_strategy` | `SearchStrategy \| None` | LLM-designed search plan |
+| `search_round` | `int` | Current round (max 2) |
+| `category_pools` | `dict[str, POICategoryPool]` | POIs grouped by macro-category |
+
+### Plan Phase
+
+| Field | Type | Description |
+|---|---|---|
+| `plan` | `Plan \| None` | Sub-task DAG (final fused plan) |
+| `agent_plans` | `list[AgentPlan]` | Raw plans from each parallel agent |
+| `fusion_result` | `FusionResult \| None` | Weighted voting result |
+| `plan_cards` | `list[PlanCard]` | UI-friendly display cards |
+| `modify_count` | `int` | QA modify loop guard (max 3) |
+| `plan_iterations` | `int` | Legacy verify→adjust guard |
+| `modify_feedback` | `str` | User modification request text |
+
+### Execution Phase
+
+| Field | Type | Description |
+|---|---|---|
+| `next_action` | `str` | Routing signal |
+| `bookings` | `dict[str, BookingResult]` | Merged via `_merge_bookings` reducer for fan-in |
+| `execution_status` | `Literal["idle", "running", "partial", "done", "failed", "compensated"]` | Aggregate status |
+| `current_task_id` | `str \| None` | Set by `Send.arg` per worker instance |
+| `current_retry_count` | `int` | Set by `Send.arg` per worker instance |
+
+### Core Data Models
+
+```python
+class SubTask:
     id: str
     type: Literal["search", "compare", "book"]
     target: str
     dependencies: list[str]
     params: dict
-    compensatory: str | None
+    compensatory: str | None       # cancel task ID for Saga compensation
 
-class Plan(TypedDict):
+class Plan:
     sub_tasks: list[SubTask]
-    total_cost: float
+    total_cost_estimate: float
     notes: str
 
-class Verification(TypedDict):
-    score: float           # 0-1
-    issues: list[str]
-    status: Literal["pass", "fix", "reject"]
-
-class BookingResult(TypedDict):
+class BookingResult:
     task_id: str
-    status: Literal["pending", "success", "failed", "cancelled"]
+    status: Literal["pending", "success", "failed", "cancelled", "compensated"]
     order_id: str | None
     error: str | None
-
-class AgentState(TypedDict):
-    # === User input ===
-    user_input: str
-    messages: list          # full conversation (LangGraph add_messages reducer)
-
-    # === Clarify phase ===
-    intent: Intent | None
-
-    # === Plan phase ===
-    plan: Plan | None
-    verification: Verification | None
-    plan_iterations: int    # correction count, max 3
-
-    # === Execution phase ===
-    bookings: dict[str, BookingResult]  # task_id → result
-    execution_status: Literal["idle", "running", "partial", "done", "failed"]
-
-    # === Control ===
-    next_action: str        # set by edge functions for routing
+    error_type: Literal["transient", "recoverable", "fatal"] | None
+    retries: int
 ```
+
+---
+
+## MCP Tool Calling Chain
+
+```
+LangGraph Node
+  → mcp_session(server, url)         # streamable_http_client lifecycle
+    → initialize + list_tools
+    → whitelist filter (12 Amap APIs)
+    → JSON Schema → Pydantic args_schema → LangChain BaseTool
+  → react_loop(model, tools, ...)    # bind_tools → LLM → execute → ToolMessage → loop
+    → max 5 tool call rounds
+```
+
+**Design note:** Sessions are NOT cached across nodes because LangGraph may run each node in a different asyncio task, and `anyio` cancel scopes don't cross task boundaries.
 
 ---
 
 ## Error Handling Summary
 
-| Error Location | Strategy | User Perception |
+| Location | Strategy | User Perception |
 |---|---|---|
-| `clarify` — insufficient info | Ask up to 3 rounds, then proceed with defaults | Perceived (follow-up questions) |
-| `decompose` — cannot plan | Fallback to simple recommendations + notice | Perceived (informed) |
-| `verify` — plan fails | Auto-correct up to 3 iterations | Not perceived |
-| `execute` — partial failure | Compensate + retry + alternatives | Perceived (informed) |
-| `execute` — total failure | Compensate all completed items + notify | Perceived (informed) |
-| User interruption mid-flow | LangGraph checkpoint persists state; resume later | Perceived (resume prompt) |
-| System crash | Sync checkpoint already persisted; resume on restart | Not perceived |
-
----
-
-## Implementation Roadmap
-
-1. **`clarify_intent` + `route`** — Structured intent extraction, simple vs complex routing
-2. **`decompose_and_plan` + `verify_plan` + loop** — Core planning cycle
-3. **`present_to_user` (HITL)** — User confirmation gate
-4. **`execute_bookings` fan-out** — Parallel execution (mock tools first)
-5. **`handle_failures` + compensation** — Error recovery loop
-
----
-
-## References
-
-- VMAO: Verified Multi-Agent Orchestration — arXiv:2603.11445
-- LLMCompiler: Parallel Function Calling — arXiv:2312.04511
-- TaskWeaver: Code-First Agent Framework — arXiv:2311.17541
-- LangGraph: [langchain-ai/langgraph](https://github.com/langchain-ai/langgraph)
-- CrewAI: [crewAIInc/crewAI](https://github.com/crewAIInc/crewAI)
-- AutoGen: [microsoft/autogen](https://github.com/microsoft/autogen)
+| `clarify_intent` — JSON parse fail | Fallback to clarify route, generic follow-up | Perceived (re-asked) |
+| `context_agent` — MCP fail | `weather=None`, downstream skips weather logic | Not perceived |
+| `multi_agent_plan` — 1 agent fails | Use surviving agent's plan | Not perceived |
+| `multi_agent_plan` — both fail | Empty plan, route to present (user sees degraded result) | Perceived |
+| `plan_fusion` — LLM fail | `_fallback_fusion` uses Agent 1 plan | Not perceived |
+| `qa_check` — LLM fail | Pass-through fused plan unchanged | Not perceived |
+| `book_worker` — transient fail | Retry up to 2× via `Send()` fan-out | Not perceived (unless exhausted) |
+| `book_worker` — recoverable fail | Run compensatory cancel, mark compensated | Perceived (informed in summary) |
+| `book_worker` — fatal fail | Escalate to `notify_user` | Perceived (manual action needed) |
+| User interrupt mid-flow | LangGraph checkpoint persists; resume from breakpoint | Perceived (resume prompt) |
+| System crash | `MemorySaver` checkpoint; resume on restart | Not perceived |

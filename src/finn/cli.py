@@ -73,20 +73,23 @@ _STYLE = Style.from_dict({
 })
 
 
-def _summarise_intent(intent) -> str:
-    """Create a short Chinese summary of an Intent for trip memory."""
+def _summarise_extract(extract) -> str:
+    """Create a short Chinese summary of an ExtractResult for trip memory."""
     parts = []
-    if intent.scenario and intent.scenario != "unknown":
-        labels = {"family": "家人", "friends": "朋友", "couple": "情侣", "solo": "独自"}
-        parts.append(f"与{labels.get(intent.scenario, intent.scenario)}")
-    if intent.party_size:
-        parts.append(f"{intent.party_size}人")
-    if intent.activity:
-        parts.append(intent.activity)
-    if intent.area:
-        parts.append(f"在{intent.area}")
-    if intent.budget_per_person:
-        parts.append(f"人均{int(intent.budget_per_person)}元")
+    i = extract.intent
+    if i.scene:
+        labels = {"family": "家人", "friends": "朋友"}
+        parts.append(f"与{labels.get(i.scene.value, i.scene.value)}")
+    if i.guest_count:
+        parts.append(f"{i.guest_count}人")
+    if i.activity_summary:
+        parts.append(i.activity_summary)
+    if i.city:
+        parts.append(f"在{i.city}")
+    hc = extract.hard_constraints
+    if hc.budget_max_cny and i.guest_count:
+        per_person = int(hc.budget_max_cny / i.guest_count)
+        parts.append(f"人均{per_person}元")
     return "，".join(parts)
 
 
@@ -264,7 +267,10 @@ class CLI:
             # ── Push callbacks & invoke graph ──
             self._push_callbacks()
             state = await graph.ainvoke(
-                {"messages": [{"role": "user", "content": enriched_input}]},
+                {
+                    "messages": [{"role": "user", "content": enriched_input}],
+                    "user_coords": ctx.get("location_coords") or "",
+                },
                 config,
             )
 
@@ -314,11 +320,11 @@ class CLI:
     # ── response display ────────────────────────────────────────────
 
     def _display_response(self, state: dict) -> None:
-        intent = state.get("intent")
+        extract = state.get("extract_result")
         next_action = state.get("next_action", "")
 
-        if intent and intent.follow_up_question:
-            self._console.print(f"\nFinn: {intent.follow_up_question}\n")
+        if extract and extract.follow_up_question:
+            self._console.print(f"\nFinn: {extract.follow_up_question}\n")
         elif next_action == "cancel":
             self._console.print("\nFinn: 好的，已取消。有需要随时找我。\n")
         elif state.get("messages"):
@@ -341,13 +347,13 @@ class CLI:
 
         CST = timezone(timedelta(hours=8))
 
-        intent = state.get("intent")
+        extract = state.get("extract_result")
         execution_status = state.get("execution_status", "")
 
         # Only learn from trips that actually ran (not clarify rounds or cancels)
-        if not intent or not intent.activity:
+        if not extract or not extract.intent.activity_summary:
             return
-        if intent.follow_up_question:
+        if extract.follow_up_question:
             return  # clarify round — no trip happened
         if execution_status not in ("done", "partial"):
             return
@@ -355,8 +361,8 @@ class CLI:
         plan = state.get("plan")
         memory = MemoryManager()
 
-        # Extract preference signals
-        learnings = extract_learnings_from_trip(intent, plan)
+        # Extract preference signals from extract_result
+        learnings = extract_learnings_from_trip(extract, plan)
         if learnings:
             memory.update_preferences(learnings)
             logger.debug("Learned %d preference items from trip", len(learnings))
@@ -364,25 +370,43 @@ class CLI:
         # Build trip memory
         now = datetime.now(CST)
         trip_id = str(uuid.uuid4())[:8]
+        i = extract.intent
         trip = TripMemory(
             id=trip_id,
             created_at=now.isoformat(),
-            intent_summary=_summarise_intent(intent),
-            scenario=intent.scenario or "unknown",
-            activity=intent.activity,
-            date=intent.date,
-            area=intent.area,
-            party_size=intent.party_size,
-            budget_total=intent.budget_total,
+            intent_summary=_summarise_extract(extract),
+            scenario=i.scene.value if i.scene else "unknown",
+            activity=i.activity_summary or "",
+            date=i.plan_date,
+            area=i.city,
+            party_size=i.guest_count,
+            budget_total=extract.hard_constraints.budget_max_cny,
             plan_notes=plan.notes if plan else "",
             outcome="completed",
             extracted_learnings=learnings,
         )
         memory.save_trip(trip)
 
-        # Update saved party members if new ones were described
-        if intent.party_members:
+        # Update saved party members — extract from group tags
+        if extract.group.tags:
             profile = memory.load_profile()
-            if not profile.saved_party_members and intent.party_members:
-                profile.saved_party_members = intent.party_members
-                memory.save_profile(profile)
+            # Track group composition via tags (lightweight profile enrichment)
+            if not profile.saved_party_members and extract.group.tags:
+                from finn.state import PartyMember
+                members = []
+                for tag in extract.group.tags:
+                    if tag.startswith("child_"):
+                        try:
+                            age_str = tag.replace("child_", "").replace("yo", "")
+                            age = int(age_str) if age_str.isdigit() else None
+                        except ValueError:
+                            age = None
+                        members.append(PartyMember(
+                            role="child",
+                            age=age,
+                            constraints=extract.group.hard_constraints,
+                            preferences=extract.group.soft_preferences,
+                        ))
+                if members:
+                    profile.saved_party_members = members[:4]
+                    memory.save_profile(profile)

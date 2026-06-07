@@ -89,9 +89,9 @@ class UserProfile(BaseModel):
 class TripMemory(BaseModel):
     """Episodic memory of a single completed trip.
 
-    Stores a *reduced* copy of the original Intent — flat fields rather
+    Stores a *reduced* copy of the extraction result — flat fields rather
     than the full nested Pydantic model so the on-disk format is stable
-    even as the Intent model evolves.
+    even as the ExtractResult model evolves.
     """
 
     id: str = ""

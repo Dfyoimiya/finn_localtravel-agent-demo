@@ -1,13 +1,13 @@
 """Deterministic preference extraction from completed trips.
 
 No LLM call — uses curated keyword dictionaries to identify cuisine
-and activity preferences from the Intent and Plan text.
+and activity preferences from the ExtractResult and Plan text.
 """
 
 from __future__ import annotations
 
 from finn.memory.models import PreferenceCategory
-from finn.state import Intent, Plan
+from finn.state import ExtractResult, Plan
 
 # ── Keyword dictionaries ────────────────────────────────────────────────
 
@@ -101,15 +101,15 @@ def _match_keywords(text: str, keyword_map: dict[str, str]) -> list[str]:
 
 
 def extract_learnings_from_trip(
-    intent: Intent,
+    extract: ExtractResult,
     plan: Plan | None = None,
 ) -> list[PreferenceCategory]:
     """Extract preference signals from a completed trip.
 
     Parameters
     ----------
-    intent:
-        The clarified Intent from the trip.
+    extract:
+        The ExtractResult from the trip.
     plan:
         The final Plan (may be None if trip was cancelled early).
 
@@ -121,7 +121,8 @@ def extract_learnings_from_trip(
     now = ""  # filled by caller in manager; we return items without timestamps
     items: list[PreferenceCategory] = []
 
-    activity_text = intent.activity or ""
+    # Build a combined text for keyword matching
+    activity_text = extract.intent.activity_summary or ""
 
     # ── Cuisine keywords ───────────────────────────────────────────
     for cuisine in _match_keywords(activity_text, CUISINE_KEYWORDS):
@@ -135,6 +136,19 @@ def extract_learnings_from_trip(
             )
         )
 
+    # Also match against preferred_cuisines
+    for cuisine in extract.soft_constraints.preferred_cuisines:
+        if cuisine not in {i.value for i in items if i.category == "dining"}:
+            items.append(
+                PreferenceCategory(
+                    category="dining",
+                    value=cuisine,
+                    confidence=0.60,
+                    source="inferred",
+                    occurrences=1,
+                )
+            )
+
     # ── Activity keywords ──────────────────────────────────────────
     for activity in _match_keywords(activity_text, ACTIVITY_KEYWORDS):
         items.append(
@@ -147,24 +161,27 @@ def extract_learnings_from_trip(
             )
         )
 
-    # ── Area ───────────────────────────────────────────────────────
-    if intent.area:
+    # ── Area / City ─────────────────────────────────────────────────
+    if extract.intent.city:
         items.append(
             PreferenceCategory(
                 category="area",
-                value=intent.area,
+                value=extract.intent.city,
                 confidence=0.55,
                 source="inferred",
                 occurrences=1,
             )
         )
 
-    # ── Budget ─────────────────────────────────────────────────────
-    if intent.budget_per_person is not None:
+    # ── Budget (derive per-person from total / guest count) ──────────
+    hc = extract.hard_constraints
+    i = extract.intent
+    if hc.budget_max_cny is not None and i.guest_count and i.guest_count > 0:
+        per_person = hc.budget_max_cny / i.guest_count
         items.append(
             PreferenceCategory(
                 category="budget",
-                value=str(intent.budget_per_person),
+                value=str(int(per_person)),
                 confidence=0.50,
                 source="inferred",
                 occurrences=1,
@@ -172,7 +189,17 @@ def extract_learnings_from_trip(
         )
 
     # ── Hard constraints (explicit, high confidence) ────────────────
-    for constraint in intent.hard_constraints:
+    for constraint in hc.dietary_restrictions:
+        items.append(
+            PreferenceCategory(
+                category="constraint",
+                value=constraint,
+                confidence=0.85,
+                source="explicit",
+                occurrences=1,
+            )
+        )
+    for constraint in extract.group.hard_constraints:
         items.append(
             PreferenceCategory(
                 category="constraint",
@@ -184,19 +211,36 @@ def extract_learnings_from_trip(
         )
 
     # ── Preferences (explicit, medium-high confidence) ──────────────
-    for pref in intent.preferences:
+    for pref in extract.soft_constraints.preferred_poi_types:
         items.append(
             PreferenceCategory(
-                category="general",
+                category="activity",
                 value=pref,
-                confidence=0.75,
+                confidence=0.70,
                 source="explicit",
                 occurrences=1,
             )
         )
-
-    # ── Scenario tracking (count only, handled in manager) ─────────
-    # (This is done in manager.save_trip when it updates favorite_scenarios)
+    for pref in extract.soft_constraints.preferred_cuisines:
+        items.append(
+            PreferenceCategory(
+                category="dining",
+                value=pref,
+                confidence=0.70,
+                source="explicit",
+                occurrences=1,
+            )
+        )
+    for pref in extract.group.soft_preferences:
+        items.append(
+            PreferenceCategory(
+                category="general",
+                value=pref,
+                confidence=0.65,
+                source="explicit",
+                occurrences=1,
+            )
+        )
 
     # ── Plan notes (free-text hints) ────────────────────────────────
     if plan and plan.notes:
